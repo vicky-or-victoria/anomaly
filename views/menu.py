@@ -657,11 +657,23 @@ class EnlistView(View):
 
     @discord.ui.button(label="⚔️ Enlist Now",  style=discord.ButtonStyle.success,   custom_id="enlist_board_enlist")
     async def enlist_now(self, i: discord.Interaction, b: Button):
+        """Open the contract board so the player can pick a contract and enlist."""
         await _send_contract_board(i)
 
     @discord.ui.button(label="🚀 Deploy",       style=discord.ButtonStyle.primary,   custom_id="enlist_board_deploy")
     async def deploy_now(self, i: discord.Interaction, b: Button):
-        await _send_contract_board(i)
+        """Open the contract board so a returning player can redeploy their rostered unit."""
+        try:
+            from cogs.squadron_cog import open_returning_deploy
+            await open_returning_deploy(i)
+        except Exception as e:
+            try:
+                if not i.response.is_done():
+                    await i.response.send_message(f"❌ {e}", ephemeral=True)
+                else:
+                    await i.followup.send(f"❌ {e}", ephemeral=True)
+            except Exception:
+                pass
 
     @discord.ui.button(label="📖 Brigade Info", style=discord.ButtonStyle.secondary, custom_id="enlist_board_brigades")
     async def brigade_info(self, i: discord.Interaction, b: Button):
