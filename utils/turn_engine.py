@@ -1,0 +1,863 @@
+"""
+Warbot — Turn Engine v3
+Brigade-aware, flat hex system, no FOB concept.
+
+Each turn:
+  1. Process transit (brigade-specific turn counts)
+  2. Apply GM enemy moves
+  3. Enemy AI moves / spawns
+  4. Resolve combat (brigade modifiers)
+  5. Apply supply drain (brigade-specific rates)
+  6. Recompute hex statuses
+  7. Reset per-turn flags (dug_in, artillery_armed)
+  8. Cleanup + record + post summary
+  9. Auto-update map
+"""
+
+import asyncio
+import json
+import logging
+import random
+from datetime import datetime, timezone
+
+import discord
+
+from utils.db import get_pool, get_theme, get_active_planet_id
+from utils.combat import resolve_combat, CombatUnit
+from utils.profiles import mark_recovering
+from utils.brigades import (
+    transit_turns as brigade_transit, supply_drain as brigade_drain,
+    move_steps as brigade_steps, can_direct_insert,
+)
+from utils.hexmap import (
+    GRID_COORDS, GRID_SET,
+    hex_key, parse_hex, hex_neighbors, hex_distance, is_valid,
+    hex_ring_keys, nearest_hex, step_toward,
+    outermost_hexes, recompute_statuses,
+    STATUS_PLAYER, STATUS_ENEMY,
+)
+
+log = logging.getLogger(__name__)
+
+_UNIT_ROSTERS = {
+    "AI Legion":         ["Scout-Form", "Heavy-Form", "Shepherd", "Juggernaut", "Specter"],
+    "Pirate Fleet":      ["Raider",     "Corsair",    "Marauder",  "Dreadnaught","Ghost Ship"],
+    "Civil War Militia": ["Infantry",   "Irregular",  "Heavy Mil", "Guerrilla",  "War Chief"],
+    "Rogue Syndicate":   ["Enforcer",   "Vanguard",   "Assault",   "Titan",      "Shadow Op"],
+    "Xeno Collective":   ["Drone",      "Brood",      "Hunter",    "Titan-Form", "Apex"],
+    "Unknown":           ["Unit-A",     "Unit-B",     "Unit-C",    "Unit-D",     "Unit-E"],
+}
+
+_MAX_SPAWNS = 2
+
+REPORT_SECTIONS = [
+    ("movement", "Movement"),
+    ("combat", "Contact / Combat"),
+    ("casualties", "Casualties"),
+    ("supply", "Supply"),
+    ("territory", "Territory"),
+    ("other", "Other Signals"),
+]
+
+REPORT_FIELD_LIMIT = 1000
+REPORT_EMBED_LIMIT = 5600
+REPORT_CONTINUED_TITLE = "continued"
+
+
+def _roster(enemy_type: str) -> list:
+    return _UNIT_ROSTERS.get(enemy_type, _UNIT_ROSTERS["Unknown"])
+
+
+def _rand_stats(aggression: int = 0) -> dict:
+    v = lambda: random.randint(-2, 2)
+    b = 9 + aggression
+    return dict(attack=b+v(), defense=b+v(), speed=b+v(),
+                morale=b+v(), supply=b+v(), recon=b+v())
+
+
+def _clean_report_line(line: str) -> str:
+    """Keep report lines compact and readable inside Discord fields."""
+    cleaned = " ".join(str(line).split())
+    cleaned = cleaned.replace("->", "->").replace("--", "-")
+    cleaned = "".join(ch if ord(ch) < 128 else " " for ch in cleaned)
+    cleaned = " ".join(cleaned.split())
+    while cleaned and not (cleaned[0].isalnum() or cleaned[0] in ("*", "`", "#")):
+        cleaned = cleaned[1:].lstrip()
+    return cleaned
+
+
+def _split_report_line(line: str, limit: int = REPORT_FIELD_LIMIT) -> list:
+    if len(line) <= limit:
+        return [line]
+    chunks = []
+    remaining = line
+    while len(remaining) > limit:
+        cut = remaining.rfind(" ", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def _report_section(line: str) -> str:
+    text = line.lower()
+    if any(token in text for token in ("arrived at", "moved to", "fell back", "routed from")):
+        return "movement"
+    if any(token in text for token in ("critically low on supply", "supply")):
+        return "supply"
+    if any(token in text for token in ("destroyed", "damage", " hp", "remaining", "splash")):
+        return "casualties"
+    if any(token in text for token in ("routed", "control", "captured", "secured")):
+        return "territory"
+    if ":" in line or any(token in text for token in ("combat", "engaged", "attack", "defend", "wins")):
+        return "combat"
+    return "other"
+
+
+def _report_tag(section: str) -> str:
+    return {
+        "movement": "MOVE",
+        "combat": "CONTACT",
+        "casualties": "LOSS",
+        "supply": "SUPPLY",
+        "territory": "TERRAIN",
+        "other": "SIGNAL",
+    }.get(section, "SIGNAL")
+
+
+def _section_report_lines(summaries: list) -> dict:
+    sections = {key: [] for key, _ in REPORT_SECTIONS}
+    for raw in summaries:
+        line = _clean_report_line(raw)
+        section = _report_section(line)
+        sections.setdefault(section, []).append(f"`{_report_tag(section)}` {line}")
+    return sections
+
+
+def _append_field_chunks(embeds, section_title: str, lines: list, color: int):
+    if not lines:
+        return
+
+    chunk = []
+    chunk_len = 0
+    for raw_line in lines:
+        for line in _split_report_line(raw_line):
+            add_len = len(line) + 1
+            if chunk and chunk_len + add_len > REPORT_FIELD_LIMIT:
+                _append_report_field(embeds, section_title, "\n".join(chunk), color)
+                section_title = f"{section_title} (cont.)"
+                chunk = []
+                chunk_len = 0
+            chunk.append(line)
+            chunk_len += add_len
+
+    if chunk:
+        _append_report_field(embeds, section_title, "\n".join(chunk), color)
+
+
+def _report_loss_counts(sections: dict, theme: dict) -> tuple:
+    enemy_name = theme.get("enemy_faction", "Enemy").lower()
+    enemy_unit = theme.get("enemy_unit", "Enemy").lower()
+    enemy_losses = 0
+    player_losses = 0
+    for line in sections.get("casualties", []):
+        text = line.lower()
+        if "destroyed" not in text:
+            continue
+        if enemy_name in text or enemy_unit in text or "[enemy" in text:
+            enemy_losses += 1
+        else:
+            player_losses += 1
+    return player_losses, enemy_losses
+
+
+def _signal_integrity_status(sections: dict, total_events: int) -> str:
+    supply_events = len(sections.get("supply", []))
+    casualty_events = len(sections.get("casualties", []))
+    combat_events = len(sections.get("combat", []))
+    if casualty_events >= 5 or supply_events >= 5:
+        return "critical"
+    if total_events >= 18 or combat_events >= 4 or casualty_events >= 3 or supply_events >= 3:
+        return "strained"
+    return "stable"
+
+
+def _append_report_field(embeds, name: str, value: str, color: int):
+    current = embeds[-1]
+    projected = len(current.title or "") + len(current.description or "") + len(name) + len(value)
+    projected += sum(len(f.name or "") + len(f.value or "") for f in current.fields)
+    if current.fields and projected > REPORT_EMBED_LIMIT:
+        continued = discord.Embed(
+            title=f"{current.title} ({REPORT_CONTINUED_TITLE})",
+            color=color,
+        )
+        if current.footer and current.footer.text:
+            continued.set_footer(text=current.footer.text)
+        embeds.append(continued)
+        current = continued
+    current.add_field(name=name, value=value or "No entries.", inline=False)
+
+
+def _build_turn_report_embeds(planet_name: str, turn_num: int, summaries: list, theme: dict) -> list:
+    bot_name = theme.get("bot_name", "WARBOT")
+    color = theme.get("color", 0xAA2222)
+    sections = _section_report_lines(summaries)
+
+    total_events = len(summaries)
+    combat_events = len(sections.get("combat", []))
+    casualty_events = len(sections.get("casualties", []))
+    movement_events = len(sections.get("movement", []))
+    supply_events = len(sections.get("supply", []))
+    player_losses, enemy_losses = _report_loss_counts(sections, theme)
+
+    signal = _signal_integrity_status(sections, total_events)
+    description = (
+        f"**Contract Theatre:** {planet_name}\n"
+        f"**Turn:** {turn_num}\n"
+        f"**Events:** {total_events} total | {movement_events} movement | "
+        f"{combat_events} combat | {casualty_events} casualty | {supply_events} supply\n"
+        f"**Losses:** {player_losses} friendly | {enemy_losses} hostile\n"
+        f"**Signal Integrity:** {signal}"
+    )
+
+    embed = discord.Embed(
+        title=f"{bot_name} | Turn {turn_num} After Action Report",
+        color=color,
+        description=description,
+    )
+    embed.set_footer(text=f"{bot_name} | {theme.get('flavor_text','')}")
+    embeds = [embed]
+
+    if not summaries:
+        _append_report_field(embeds, "Quiet Sectors", "No activity this turn.", color)
+        return embeds
+
+    for key, title in REPORT_SECTIONS:
+        _append_field_chunks(embeds, title, sections.get(key, []), color)
+
+    return embeds
+
+
+def _turn_report_summary_embed(planet_name: str, turn_num: int, summaries: list, theme: dict) -> discord.Embed:
+    bot_name = theme.get("bot_name", "WARBOT")
+    color = theme.get("color", 0xAA2222)
+    sections = _section_report_lines(summaries)
+    player_losses, enemy_losses = _report_loss_counts(sections, theme)
+
+    signal = _signal_integrity_status(sections, len(summaries))
+    description = (
+        f"**Contract Theatre:** {planet_name}\n"
+        f"**Turn:** {turn_num}\n"
+        f"**Events:** {len(summaries)} total | {len(sections.get('movement', []))} movement | "
+        f"{len(sections.get('combat', []))} combat | "
+        f"{len(sections.get('casualties', []))} casualty | "
+        f"{len(sections.get('supply', []))} supply\n"
+        f"**Losses:** {player_losses} friendly | {enemy_losses} hostile\n"
+        f"**Signal Integrity:** {signal}"
+    )
+    embed = discord.Embed(
+        title=f"{bot_name} | Turn {turn_num} After Action Report",
+        color=color,
+        description=description,
+    )
+    embed.set_footer(text=f"{bot_name} | {theme.get('flavor_text','')}")
+    return embed
+
+
+def _build_report_detail_embeds(
+    planet_name: str,
+    turn_num: int,
+    summaries: list,
+    theme: dict,
+    detail_title: str,
+    section_keys: list,
+) -> list:
+    bot_name = theme.get("bot_name", "WARBOT")
+    color = theme.get("color", 0xAA2222)
+    sections = _section_report_lines(summaries)
+    embed = discord.Embed(
+        title=f"{bot_name} | Turn {turn_num} {detail_title}",
+        color=color,
+        description=f"Contract Theatre: **{planet_name}**",
+    )
+    embed.set_footer(text=f"{bot_name} | private tactical detail")
+    embeds = [embed]
+
+    any_entries = False
+    section_titles = dict(REPORT_SECTIONS)
+    for key in section_keys:
+        lines = sections.get(key, [])
+        if lines:
+            any_entries = True
+        _append_field_chunks(embeds, section_titles.get(key, key.title()), lines, color)
+
+    if not any_entries:
+        _append_report_field(embeds, detail_title, "No entries for this turn.", color)
+
+    return embeds
+
+
+class TurnReportView(discord.ui.View):
+    def __init__(self, planet_name: str = None, turn_num: int = None,
+                 summaries: list = None, theme: dict = None):
+        super().__init__(timeout=None)
+        self.planet_name = planet_name
+        self.turn_num = turn_num
+        self.summaries = list(summaries or [])
+        self.theme = dict(theme or {})
+
+    async def _load_report(self, interaction: discord.Interaction):
+        if self.planet_name and self.turn_num is not None:
+            return self.planet_name, self.turn_num, self.summaries, self.theme
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT planet_name, turn_number, summaries_json, theme_json "
+                "FROM turn_report_messages WHERE message_id=$1",
+                interaction.message.id if interaction.message else 0)
+        if not row:
+            return None
+        return (
+            row["planet_name"],
+            row["turn_number"],
+            json.loads(row["summaries_json"] or "[]"),
+            json.loads(row["theme_json"] or "{}"),
+        )
+
+    async def _send_detail(self, interaction: discord.Interaction, title: str, section_keys: list):
+        loaded = await self._load_report(interaction)
+        if not loaded:
+            await interaction.response.send_message(
+                "This report predates the persistent archive and can no longer be expanded.",
+                ephemeral=True)
+            return
+        planet_name, turn_num, summaries, theme = loaded
+        embeds = _build_report_detail_embeds(
+            planet_name,
+            turn_num,
+            summaries,
+            theme,
+            title,
+            section_keys,
+        )
+        await interaction.response.send_message(embeds=embeds[:10], ephemeral=True)
+
+    @discord.ui.button(label="Movement", style=discord.ButtonStyle.primary,
+                       custom_id="turn_report_movement")
+    async def movement(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._send_detail(interaction, "Movement Report", ["movement"])
+
+    @discord.ui.button(label="Combat", style=discord.ButtonStyle.danger,
+                       custom_id="turn_report_combat")
+    async def combat(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._send_detail(interaction, "Combat Report", ["combat", "casualties", "territory", "other"])
+
+    @discord.ui.button(label="Supply", style=discord.ButtonStyle.secondary,
+                       custom_id="turn_report_supply")
+    async def supply(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._send_detail(interaction, "Supply Report", ["supply"])
+
+
+class TurnEngine:
+    def __init__(self, bot):
+        self.bot   = bot
+        self._task = None
+
+    def start(self):
+        self._task = asyncio.create_task(self._loop())
+
+    def stop(self):
+        if self._task:
+            self._task.cancel()
+
+    async def _loop(self):
+        while True:
+            try:
+                await self._tick_all()
+            except Exception as e:
+                log.error(f"Turn engine error: {e}", exc_info=True)
+            await asyncio.sleep(60)
+
+    async def _tick_all(self):
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            guilds = await conn.fetch(
+                "SELECT guild_id, turn_interval_hours, last_turn_at, game_started "
+                "FROM guild_config")
+        now = datetime.now(timezone.utc)
+        for g in guilds:
+            if not g["game_started"]:
+                continue
+            elapsed = (now - g["last_turn_at"].replace(tzinfo=timezone.utc)).total_seconds()
+            if elapsed / 3600 >= g["turn_interval_hours"]:
+                pool = await get_pool()
+                async with pool.acquire() as conn:
+                    await self._resolve(conn, g["guild_id"])
+
+    async def _resolve(self, conn, guild_id: int):
+        theme     = await get_theme(conn, guild_id)
+        planet_id = await get_active_planet_id(conn, guild_id)
+        planet    = await conn.fetchrow(
+            "SELECT name, enemy_type FROM planets WHERE guild_id=$1 AND id=$2",
+            guild_id, planet_id)
+        enemy_type  = planet["enemy_type"] if planet else "Unknown"
+        planet_name = planet["name"]       if planet else "Unknown"
+        turn_num    = (await conn.fetchval(
+            "SELECT COUNT(*) FROM turn_history WHERE guild_id=$1 AND planet_id=$2",
+            guild_id, planet_id) or 0) + 1
+        summaries = []
+        # movement_arrows: list of (from_addr, to_addr, "player"|"enemy")
+        movement_arrows: list = []
+
+        log.info(f"[{guild_id}] Turn {turn_num} on {planet_name}")
+
+        async with conn.transaction():
+            await self._transit(conn, guild_id, planet_id, summaries, theme, movement_arrows)
+            await self._gm_moves(conn, guild_id, planet_id, summaries, theme)
+            await self._enemy_ai(conn, guild_id, planet_id, summaries, theme, enemy_type, movement_arrows)
+            await self._combat(conn, guild_id, planet_id, turn_num, summaries, theme, enemy_type, movement_arrows)
+            await self._supply(conn, guild_id, planet_id, summaries, theme)
+            await recompute_statuses(conn, guild_id, planet_id)
+
+            # Reset per-turn flags
+            await conn.execute(
+                "UPDATE squadrons SET is_dug_in=FALSE, artillery_armed=FALSE, "
+                "hexes_moved_this_turn=0 "
+                "WHERE guild_id=$1 AND planet_id=$2",
+                guild_id, planet_id)
+            await conn.execute(
+                "UPDATE enemy_units SET manually_moved=FALSE "
+                "WHERE guild_id=$1 AND planet_id=$2", guild_id, planet_id)
+            await conn.execute(
+                "DELETE FROM enemy_gm_moves WHERE guild_id=$1 AND planet_id=$2",
+                guild_id, planet_id)
+            await conn.execute(
+                "DELETE FROM enemy_units WHERE guild_id=$1 AND planet_id=$2 AND is_active=FALSE",
+                guild_id, planet_id)
+            await conn.execute(
+                "INSERT INTO turn_history (guild_id, planet_id, turn_number) VALUES ($1,$2,$3)",
+                guild_id, planet_id, turn_num)
+            await conn.execute(
+                "UPDATE guild_config SET last_turn_at=NOW() WHERE guild_id=$1", guild_id)
+
+        await self._post(guild_id, planet_name, turn_num, summaries, theme)
+        try:
+            from cogs.map_cog import auto_update_map
+            await auto_update_map(self.bot, guild_id, movement_arrows=movement_arrows)
+        except Exception as e:
+            log.warning(f"auto_update_map: {e}")
+        try:
+            from views.menu import refresh_public_panels
+            pool = await get_pool()
+            async with pool.acquire() as live_conn:
+                await refresh_public_panels(self.bot, guild_id, live_conn)
+        except Exception as e:
+            log.warning(f"public panel refresh: {e}")
+
+        # Clear persisted player movement arrows — new turn = blank slate
+        try:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "DELETE FROM movement_arrows WHERE guild_id=$1 AND planet_id=$2",
+                    guild_id, planet_id)
+        except Exception as e:
+            log.warning(f"movement_arrows clear: {e}")
+
+    # ── Transit ───────────────────────────────────────────────────────────────
+
+    async def _transit(self, conn, guild_id, planet_id, summaries, theme, movement_arrows):
+        rows = await conn.fetch(
+            "SELECT id, name, owner_name, brigade, hex_address, "
+            "transit_destination, transit_turns_left "
+            "FROM squadrons "
+            "WHERE guild_id=$1 AND planet_id=$2 AND in_transit=TRUE AND is_active=TRUE",
+            guild_id, planet_id)
+        ul = theme.get("player_unit", "Unit")
+        for sq in rows:
+            turns_left = sq["transit_turns_left"] - 1
+            dest       = sq["transit_destination"]
+            if turns_left <= 0:
+                movement_arrows.append((sq["hex_address"], dest, "player"))
+                await conn.execute(
+                    "UPDATE squadrons SET hex_address=$1, in_transit=FALSE, "
+                    "transit_destination=NULL, transit_turns_left=0 WHERE id=$2",
+                    dest, sq["id"])
+                summaries.append(
+                    f"✅ **{sq['owner_name']}'s {sq['name']}** ({ul}) "
+                    f"arrived at `{dest}`.")
+            else:
+                # Step one hex closer each turn
+                next_hex = step_toward(sq["hex_address"], dest)
+                if next_hex != sq["hex_address"]:
+                    movement_arrows.append((sq["hex_address"], next_hex, "player"))
+                await conn.execute(
+                    "UPDATE squadrons SET hex_address=$1, transit_turns_left=$2 WHERE id=$3",
+                    next_hex, turns_left, sq["id"])
+
+    # ── GM moves ──────────────────────────────────────────────────────────────
+
+    async def _gm_moves(self, conn, guild_id, planet_id, summaries, theme):
+        moves = await conn.fetch(
+            "SELECT gm.enemy_unit_id, gm.target_address, eu.unit_type "
+            "FROM enemy_gm_moves gm "
+            "JOIN enemy_units eu ON eu.id=gm.enemy_unit_id "
+            "WHERE gm.guild_id=$1 AND gm.planet_id=$2", guild_id, planet_id)
+        for m in moves:
+            await conn.execute(
+                "UPDATE enemy_units SET hex_address=$1, manually_moved=TRUE WHERE id=$2",
+                m["target_address"], m["enemy_unit_id"])
+            summaries.append(
+                f"🎮 **{theme.get('enemy_unit','Enemy')} [{m['unit_type']}]** "
+                f"moved to `{m['target_address']}` (GM).")
+
+    # ── Enemy AI ──────────────────────────────────────────────────────────────
+
+    async def _enemy_ai(self, conn, guild_id, planet_id, summaries, theme, enemy_type, movement_arrows):
+        # AI spawning has been removed — only GMs may spawn enemy units.
+        # Existing units (not GM-moved this turn) move toward player positions automatically.
+        units = await conn.fetch(
+            "SELECT id, hex_address FROM enemy_units "
+            "WHERE guild_id=$1 AND planet_id=$2 AND is_active=TRUE AND manually_moved=FALSE",
+            guild_id, planet_id)
+        p_hexes = [r["hex_address"] for r in await conn.fetch(
+            "SELECT hex_address FROM squadrons "
+            "WHERE guild_id=$1 AND planet_id=$2 AND is_active=TRUE AND in_transit=FALSE",
+            guild_id, planet_id)]
+
+        for unit in units:
+            addr  = unit["hex_address"]
+            nbrs  = hex_neighbors(addr)
+            if not nbrs:
+                continue
+            if p_hexes:
+                target_p = nearest_hex(addr, p_hexes)
+                target   = step_toward(addr, target_p)
+            else:
+                target = step_toward(addr, "0,0")
+            if target != addr:
+                movement_arrows.append((addr, target, "enemy"))
+                await conn.execute(
+                    "UPDATE enemy_units SET hex_address=$1 WHERE id=$2",
+                    target, unit["id"])
+
+    # ── Combat ────────────────────────────────────────────────────────────────
+
+    async def _combat(self, conn, guild_id, planet_id, turn_num,
+                       summaries, theme, enemy_type, movement_arrows):
+        p_rows = await conn.fetch(
+            "SELECT id, hex_address, owner_id, owner_name, name, brigade, "
+            "attack, defense, speed, morale, supply, recon, is_dug_in, artillery_armed, hp "
+            "FROM squadrons "
+            "WHERE guild_id=$1 AND planet_id=$2 AND is_active=TRUE AND in_transit=FALSE",
+            guild_id, planet_id)
+        e_rows = await conn.fetch(
+            "SELECT id, hex_address, unit_type, hp, "
+            "attack, defense, speed, morale, supply, recon "
+            "FROM enemy_units "
+            "WHERE guild_id=$1 AND planet_id=$2 AND is_active=TRUE",
+            guild_id, planet_id)
+
+        p_by_hex: dict = {}
+        for p in p_rows:
+            p_by_hex.setdefault(p["hex_address"], []).append(p)
+        e_by_hex: dict = {}
+        for e in e_rows:
+            e_by_hex.setdefault(e["hex_address"], []).append(e)
+
+        pl = theme.get("player_faction", "PMC")
+        el = theme.get("enemy_faction",  "Enemy")
+
+        contested = set(p_by_hex) & set(e_by_hex)
+
+        for hex_addr in contested:
+            p_units = p_by_hex[hex_addr]
+            e_units = e_by_hex[hex_addr]
+
+            def avg(stat):
+                return sum(u[stat] for u in p_units) // len(p_units)
+
+            # Representative brigade — use the first unit's brigade
+            rep_brigade = p_units[0]["brigade"] if p_units else "infantry"
+
+            # Fetch current HP for all player units fresh from DB
+            p_hp_map = {}
+            for pu in p_units:
+                cur_hp = await conn.fetchval(
+                    "SELECT hp FROM squadrons WHERE id=$1", pu["id"]) or 100
+                p_hp_map[pu["id"]] = cur_hp
+
+            avg_player_hp = sum(p_hp_map.values()) // max(1, len(p_hp_map))
+
+            player_cu = CombatUnit(
+                name=f"{pl} ({', '.join(u['name'] for u in p_units)})",
+                side="players",
+                attack=avg("attack"), defense=avg("defense"), speed=avg("speed"),
+                morale=avg("morale"), supply=avg("supply"),  recon=avg("recon"),
+                brigade=rep_brigade,
+                is_dug_in=any(u["is_dug_in"] for u in p_units),
+                artillery_armed=any(u["artillery_armed"] for u in p_units),
+                hp=avg_player_hp,
+            )
+
+            fatigue       = 0
+            player_routed = False
+            final_ctrl    = "neutral"
+
+            for e in e_units:
+                # Fetch fresh enemy HP
+                cur_enemy_hp = await conn.fetchval(
+                    "SELECT hp FROM enemy_units WHERE id=$1", e["id"]) or 100
+                if cur_enemy_hp <= 0:
+                    # Already dead from earlier in this loop
+                    continue
+
+                # Artillery splash: find enemy hexes adjacent to hex_addr
+                adj_enemy = []
+                if rep_brigade == "artillery" and player_cu.artillery_armed:
+                    for nb in hex_neighbors(hex_addr):
+                        nb_row = await conn.fetchrow(
+                            "SELECT id FROM enemy_units "
+                            "WHERE guild_id=$1 AND planet_id=$2 AND hex_address=$3 AND is_active=TRUE",
+                            guild_id, planet_id, nb)
+                        if nb_row:
+                            adj_enemy.append(nb)
+
+                enemy_cu = CombatUnit(
+                    name=f"{el} [{e['unit_type']}]",
+                    side="enemy",
+                    attack=e["attack"], defense=e["defense"], speed=e["speed"],
+                    morale=e["morale"], supply=e["supply"],  recon=e["recon"],
+                    hp=cur_enemy_hp,
+                )
+                tired = CombatUnit(
+                    name=player_cu.name, side="players",
+                    attack=max(1, player_cu.attack  - fatigue*2),
+                    defense=player_cu.defense,
+                    speed=player_cu.speed,
+                    morale=max(1, player_cu.morale  - fatigue),
+                    supply=player_cu.supply, recon=player_cu.recon,
+                    brigade=rep_brigade,
+                    is_dug_in=player_cu.is_dug_in,
+                    artillery_armed=player_cu.artillery_armed,
+                    hp=avg_player_hp,
+                )
+                result = resolve_combat(
+                    tired, enemy_cu,
+                    attacker_hex=hex_addr,
+                    adjacent_enemy_hexes=adj_enemy,
+                )
+                await conn.execute(
+                    "INSERT INTO combat_log "
+                    "(guild_id, planet_id, turn_number, hex_address, "
+                    " attacker, defender, attacker_roll, defender_roll, outcome) "
+                    "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+                    guild_id, planet_id, turn_num, hex_addr,
+                    result.attacker, result.defender,
+                    result.attacker_roll, result.defender_roll, result.outcome)
+                summaries.append(f"⚔ **{hex_addr}**: {result.narrative}")
+
+                # ── Apply HP damage to enemy ──────────────────────────────────
+                if result.defender_damage > 0:
+                    new_enemy_hp = max(0, cur_enemy_hp - result.defender_damage)
+                    if new_enemy_hp <= 0:
+                        await conn.execute(
+                            "UPDATE enemy_units SET hp=0, is_active=FALSE WHERE id=$1",
+                            e["id"])
+                        summaries.append(
+                            f"💀 **{el} [{e['unit_type']}]** was **destroyed** at `{hex_addr}`.")
+                    else:
+                        await conn.execute(
+                            "UPDATE enemy_units SET hp=$1 WHERE id=$2",
+                            new_enemy_hp, e["id"])
+                        summaries.append(
+                            f"🩸 **{el} [{e['unit_type']}]** `{new_enemy_hp} HP` remaining.")
+
+                # ── Apply HP damage to player units ───────────────────────────
+                if result.attacker_damage > 0:
+                    active_stack = [pu for pu in p_units if p_hp_map.get(pu["id"], 0) > 0]
+                    stack_size = max(1, len(active_stack))
+                    base_damage = result.attacker_damage // stack_size
+                    remainder = result.attacker_damage % stack_size
+                    for idx, pu in enumerate(active_stack):
+                        assigned_damage = base_damage + (1 if idx < remainder else 0)
+                        if assigned_damage <= 0:
+                            continue
+                        cur_hp = p_hp_map[pu["id"]]
+                        new_hp = max(0, cur_hp - assigned_damage)
+                        p_hp_map[pu["id"]] = new_hp
+                        # Recalculate avg for next round
+                        avg_player_hp = sum(p_hp_map.values()) // max(1, len(p_hp_map))
+                        if new_hp <= 0:
+                            await conn.execute(
+                                "UPDATE squadrons SET hp=0, is_active=FALSE WHERE id=$1",
+                                pu["id"])
+                            await mark_recovering(
+                                conn, guild_id, pu["owner_id"], pu["owner_name"])
+                            summaries.append(
+                                f"💀 **{pu['owner_name']}'s {pu['name']}** was **destroyed** "
+                                f"— their command is recovering from total loss of unit cohesion.")
+                        else:
+                            await conn.execute(
+                                "UPDATE squadrons SET hp=$1 WHERE id=$2",
+                                new_hp, pu["id"])
+                            summaries.append(
+                                f"💔 **{pu['owner_name']}'s {pu['name']}** took "
+                                f"**{assigned_damage} stack damage** (`{new_hp} HP` remaining).")
+
+                # Determine hex control and routing.
+                # Routing triggers only when the winning roll beats the losing roll by 10+.
+                if result.outcome == "attacker_wins":
+                    final_ctrl = "players"
+                    enemy_routed = (result.attacker_roll - result.defender_roll) >= 10
+                    if enemy_routed:
+                        enemy_still_active = await conn.fetchval(
+                            "SELECT is_active FROM enemy_units WHERE id=$1", e["id"])
+                        if enemy_still_active:
+                            route_to = None
+                            for nb in hex_neighbors(hex_addr):
+                                player_present = await conn.fetchval(
+                                    "SELECT COUNT(*) FROM squadrons "
+                                    "WHERE guild_id=$1 AND planet_id=$2 AND hex_address=$3 "
+                                    "AND is_active=TRUE AND in_transit=FALSE",
+                                    guild_id, planet_id, nb)
+                                if not player_present:
+                                    route_to = nb
+                                    break
+                            if route_to:
+                                await conn.execute(
+                                    "UPDATE enemy_units SET hex_address=$1 WHERE id=$2",
+                                    route_to, e["id"])
+                                movement_arrows.append((hex_addr, route_to, "enemy"))
+                                summaries.append(
+                                    f"**{el} [{e['unit_type']}]** routed from `{hex_addr}` "
+                                    f"-> fell back to `{route_to}` "
+                                    f"(margin {result.attacker_roll - result.defender_roll}).")
+                            else:
+                                summaries.append(
+                                    f"**{el} [{e['unit_type']}]** held no retreat lane at `{hex_addr}` "
+                                    f"(rout margin {result.attacker_roll - result.defender_roll}).")
+                elif result.outcome == "defender_wins":
+                    final_ctrl = "enemy"
+                    fatigue   += 1
+                    if (result.defender_roll - result.attacker_roll) >= 10:
+                        player_routed = True
+                        break
+                else:
+                    final_ctrl = "neutral"
+                    fatigue   += 1
+
+                # Artillery splash damage — deal fixed 10 HP to splashed enemy units
+                if result.splash_hexes:
+                    for sh in result.splash_hexes:
+                        splash_rows = await conn.fetch(
+                            "SELECT id, unit_type, hp FROM enemy_units "
+                            "WHERE guild_id=$1 AND planet_id=$2 AND hex_address=$3 AND is_active=TRUE",
+                            guild_id, planet_id, sh)
+                        for sr in splash_rows:
+                            splash_new_hp = max(0, (sr["hp"] or 100) - 10)
+                            if splash_new_hp <= 0:
+                                await conn.execute(
+                                    "UPDATE enemy_units SET hp=0, is_active=FALSE WHERE id=$1",
+                                    sr["id"])
+                                summaries.append(
+                                    f"💥 Artillery splash destroyed **{el} [{sr['unit_type']}]** at `{sh}`.")
+                            else:
+                                await conn.execute(
+                                    "UPDATE enemy_units SET hp=$1 WHERE id=$2",
+                                    splash_new_hp, sr["id"])
+                                summaries.append(
+                                    f"💥 Artillery splash hit **{el} [{sr['unit_type']}]** at `{sh}` "
+                                    f"(`{splash_new_hp} HP` remaining).")
+
+            await conn.execute(
+                "UPDATE hexes SET controller=$1, status=$1 "
+                "WHERE guild_id=$2 AND planet_id=$3 AND address=$4",
+                final_ctrl, guild_id, planet_id, hex_addr)
+
+            if player_routed:
+                # Retreat to nearest friendly/neutral hex
+                all_hexes = await conn.fetch(
+                    "SELECT address, controller FROM hexes "
+                    "WHERE guild_id=$1 AND planet_id=$2",
+                    guild_id, planet_id)
+                candidates = [r["address"] for r in all_hexes
+                              if r["controller"] in ("players", "neutral")
+                              and r["address"] != hex_addr
+                              and is_valid(r["address"])]
+                retreat = nearest_hex(hex_addr, candidates) if candidates else None
+                if retreat:
+                    sq_ids = await conn.fetch(
+                        "SELECT id, name, owner_name FROM squadrons "
+                        "WHERE guild_id=$1 AND planet_id=$2 AND is_active=TRUE "
+                        "AND hex_address=$3",
+                        guild_id, planet_id, hex_addr)
+                    for sq in sq_ids:
+                        await conn.execute(
+                            "UPDATE squadrons SET hex_address=$1 WHERE id=$2",
+                            retreat, sq["id"])
+                    movement_arrows.append((hex_addr, retreat, "player"))
+                    summaries.append(
+                        f"🔙 **{pl}** routed from `{hex_addr}` → fell back to `{retreat}`.")
+
+    # ── Supply drain ──────────────────────────────────────────────────────────
+
+    async def _supply(self, conn, guild_id, planet_id, summaries, theme):
+        ul   = theme.get("player_unit", "Unit")
+        rows = await conn.fetch(
+            "SELECT id, name, owner_name, brigade, supply FROM squadrons "
+            "WHERE guild_id=$1 AND planet_id=$2 AND is_active=TRUE AND in_transit=FALSE",
+            guild_id, planet_id)
+        for sq in rows:
+            drain     = brigade_drain(sq["brigade"])
+            new_supply = max(0, sq["supply"] - drain)
+            await conn.execute(
+                "UPDATE squadrons SET supply=$1 WHERE id=$2", new_supply, sq["id"])
+            if new_supply <= 3:
+                summaries.append(
+                    f"⚠ **{sq['owner_name']}'s {sq['name']}** ({ul}) "
+                    f"critically low on supply (`{new_supply}`).")
+
+    # ── Post summary ──────────────────────────────────────────────────────────
+
+    async def _post(self, guild_id, planet_name, turn_num, summaries, theme):
+        guild = self.bot.get_guild(guild_id)
+        if not guild:
+            return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            cfg = await conn.fetchrow(
+                "SELECT report_channel_id FROM guild_config WHERE guild_id=$1", guild_id)
+        channel = None
+        if cfg and cfg["report_channel_id"]:
+            channel = guild.get_channel(cfg["report_channel_id"])
+        if not channel:
+            for ch in guild.text_channels:
+                if ch.permissions_for(guild.me).send_messages:
+                    channel = ch
+                    break
+        if not channel:
+            return
+        msg = await channel.send(
+            embed=_turn_report_summary_embed(planet_name, turn_num, summaries, theme),
+            view=TurnReportView(planet_name, turn_num, summaries, theme),
+        )
+        try:
+            async with pool.acquire() as conn:
+                planet_id = await get_active_planet_id(conn, guild_id)
+                await conn.execute("""
+                    INSERT INTO turn_report_messages
+                      (guild_id, planet_id, turn_number, message_id, planet_name,
+                       summaries_json, theme_json)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7)
+                    ON CONFLICT (message_id) DO UPDATE SET
+                      summaries_json=EXCLUDED.summaries_json,
+                      theme_json=EXCLUDED.theme_json
+                """,
+                    guild_id, planet_id, turn_num, msg.id, planet_name,
+                    json.dumps(summaries), json.dumps(theme))
+        except Exception as e:
+            log.warning(f"turn report archive failed: {e}")
