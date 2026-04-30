@@ -650,11 +650,11 @@ class _PagedPanelView(discord.ui.View):
                 style=item.get("style", discord.ButtonStyle.secondary),
                 row=item.get("row", idx // 5))
 
-            async def callback(i: discord.Interaction, b: discord.ui.Button = None, method=item["method"]):
-                legacy_method = getattr(self.legacy, method)
-                # Legacy view methods are defined with (self, i, b) via @discord.ui.button;
-                # when retrieved via getattr on an instance they are bound, so call as (i, b).
-                await legacy_method(i, b)
+            async def callback(i: discord.Interaction, method=item["method"]):
+                # @discord.ui.button stores a Button object on the instance, not a callable.
+                # We must retrieve the raw function from the class __dict__ and pass self explicitly.
+                raw_fn = type(self.legacy).__dict__[method]
+                await raw_fn(self.legacy, i, None)
 
             button.callback = callback
             self.add_item(button)
