@@ -1,11 +1,11 @@
 """
-Admin cog v4 — fully button-driven.
+Admin cog v4 — fully button-driven.
 
 All admin actions are accessible via /admin_panel (one slash command).
 All GM actions are accessible via /gm_panel (one slash command).
 
-/admin_panel  Ã¢â€ â€™ AdminPanelView   (game control, planets, theme, channels, roles, terrain)
-/gm_panel     Ã¢â€ â€™ GmPanelView      (spawn enemy, move enemy, list enemies)
+/admin_panel  → AdminPanelView   (game control, planets, theme, channels, roles, terrain)
+/gm_panel     → GmPanelView      (spawn enemy, move enemy, list enemies)
 """
 
 import random
@@ -88,7 +88,7 @@ async def _refresh_public_surfaces(bot, guild_id: int, conn=None, *, maps: bool 
 
 def _admin_panel_embed(theme: dict) -> discord.Embed:
     return discord.Embed(
-        title=f"⚙️ {theme.get('bot_name', 'WARBOT')} — Admin Panel",
+        title=f"⚙️ {theme.get('bot_name', 'WARBOT')} — Admin Panel",
         color=theme.get("color", 0xAA2222),
         description=(
             "**Game Control**\n"
@@ -102,7 +102,7 @@ def _admin_panel_embed(theme: dict) -> discord.Embed:
             "**Terrain**\n"
             "Set Terrain · Reset Terrain"
         ),
-    ).set_footer(text="All actions are ephemeral — only you can see them.")
+    ).set_footer(text="All actions are ephemeral — only you can see them.")
 
 
 class AdminPanelView(discord.ui.View):
@@ -127,7 +127,7 @@ class AdminPanelView(discord.ui.View):
             await i.response.send_message("Admins only.", ephemeral=True); return
         view = _ConfirmView(i.user.id)
         await i.response.send_message(
-            "Ã¢Å¡Â  This wipes **all** war data on the active planet. Confirm?",
+            "⚠️ This wipes **all** war data on the active planet. Confirm?",
             view=view, ephemeral=True)
         await view.wait()
         if not view.confirmed:
@@ -172,14 +172,14 @@ class AdminPanelView(discord.ui.View):
                 "SELECT COUNT(*) FROM turn_history WHERE guild_id=$1 AND planet_id=$2",
                 i.guild_id, planet_id) or 0
         embed = discord.Embed(
-            title=f"{theme.get('bot_name','WARBOT')} — War Status",
+            title=f"{theme.get('bot_name','WARBOT')} — War Status",
             color=theme.get("color", 0xAA2222))
         embed.add_field(name="State",    value="Active" if cfg["game_started"] else "Paused", inline=True)
         embed.add_field(name="Turn",     value=str(turns), inline=True)
         embed.add_field(name="Interval", value=f"{cfg['turn_interval_hours']}h", inline=True)
-        embed.add_field(name="Planet",   value=planet["name"]       if planet else "—", inline=True)
-        embed.add_field(name="Contractor", value=planet["contractor"] if planet else "—", inline=True)
-        embed.add_field(name="Enemy",    value=planet["enemy_type"] if planet else "—", inline=True)
+        embed.add_field(name="Planet",   value=planet["name"]       if planet else "—", inline=True)
+        embed.add_field(name="Contractor", value=planet["contractor"] if planet else "—", inline=True)
+        embed.add_field(name="Enemy",    value=planet["enemy_type"] if planet else "—", inline=True)
         embed.add_field(name=theme.get("player_faction","PMC"),  value=f"{p_count} units", inline=True)
         embed.add_field(name=theme.get("enemy_faction","Enemy"), value=f"{e_count} units", inline=True)
         embed.add_field(name="Fleets Available", value=str(cfg.get('fleet_pool_available',1) if hasattr(cfg,'get') else cfg['fleet_pool_available']), inline=True)
@@ -218,7 +218,7 @@ class AdminPanelView(discord.ui.View):
             for p in planets
         ]
         embed = discord.Embed(
-            title=f"{theme.get('bot_name','WARBOT')} — Planetary Theatres",
+            title=f"{theme.get('bot_name','WARBOT')} — Planetary Theatres",
             color=theme.get("color", 0xAA2222),
             description="\n\n".join(lines))
         embed.set_footer(text="> = Active Theatre")
@@ -302,7 +302,7 @@ class AdminPanelView(discord.ui.View):
             for gq, gr in GRID_COORDS:
                 addr    = hex_key(gq, gr)
                 terrain = terrain_map.get((gq, gr), "plains")
-                if terrain != "plains":   # skip inserting plains — it's the default
+                if terrain != "plains":   # skip inserting plains — it's the default
                     await conn.execute("""
                         INSERT INTO hex_terrain (guild_id, planet_id, address, terrain)
                         VALUES ($1,$2,$3,$4)
@@ -421,22 +421,23 @@ class AdminPanelView(discord.ui.View):
 
 def _gm_panel_embed(theme: dict) -> discord.Embed:
     return discord.Embed(
-        title=f"🎮 {theme.get('bot_name', 'WARBOT')} — GM Panel",
+        title=f"🎮 {theme.get('bot_name', 'WARBOT')} — GM Panel",
         color=theme.get("color", 0xAA2222),
         description=(
             "**Contract Control**\n"
-            "Start Contract · Pause Contract · Conclude Contract\n\n"
+            "**Create Contract** — post a new contract to the board (no data wipe).\n"
+            "**Lock Acceptance** — close sign-ups · **Assign Fleets** — open deployment · **Conclude** — end it.\n\n"
             "**Enemy Management**\n"
             "Spawn, move (single or bulk), list, or remove enemy units.\n\n"
             "**GM Map** shows ALL unit positions (players + enemies) with labels.\n\n"
-            "All actions are ephemeral — only you can see this panel."
+            "All actions are ephemeral — only you can see this panel."
         ),
     ).set_footer(text="Game Master controls")
 
 
 class GmPanelView(discord.ui.View):
     """
-    GM panel — contract control + enemy unit management.
+    GM panel — contract control + enemy unit management.
     Row 0: Start Contract | Pause Contract | Conclude Contract
     Row 1: Spawn Enemy | Move Enemy | Bulk Move | List Enemies
     Row 2: Remove Enemy | GM Map
@@ -456,10 +457,12 @@ class GmPanelView(discord.ui.View):
 
     # ──── Row 0: Contract Control ──────────────────────────────────────────────────────────────────────────────────────────────
 
-    @discord.ui.button(label="€“ Start Contract", style=discord.ButtonStyle.success, row=0)
+    @discord.ui.button(label="📋 Create Contract", style=discord.ButtonStyle.success, row=0)
     async def start_contract(self, i: discord.Interaction, b: discord.ui.Button):
+        """Post a new contract to the board for players to accept.
+        Does NOT wipe war data — use Assign Fleets to open deployment."""
         if not await self._check(i): return
-        await i.response.send_modal(_StartContractModal(self.bot))
+        await i.response.send_modal(_CreateContractModal(self.bot))
 
     @discord.ui.button(label="⏸️ Pause Contract", style=discord.ButtonStyle.secondary, row=0)
     async def pause_contract(self, i: discord.Interaction, b: discord.ui.Button):
@@ -525,14 +528,14 @@ class GmPanelView(discord.ui.View):
             await i.response.send_message("No active enemy units.", ephemeral=True); return
         lines = []
         for r in rows:
-            move_str = f" Ã¢â€ â€™ `{queued_map[r['id']]}`" if r["id"] in queued_map else ""
+            move_str = f" → `{queued_map[r['id']]}`" if r["id"] in queued_map else ""
             lines.append(
-                f"**ID {r['id']}** `{r['hex_address']}`{move_str} — "
+                f"**ID {r['id']}** `{r['hex_address']}`{move_str} — "
                 f"{r['unit_type']} (ATK:{r['attack']} DEF:{r['defense']} HP:{r['hp'] or 100})"
             )
         description = "\n".join(lines)
         embed = discord.Embed(
-            title=f"Enemy Units ({len(rows)}) — queued moves shown as Ã¢â€ â€™",
+            title=f"Enemy Units ({len(rows)}) — queued moves shown as →",
             color=theme.get("color", 0xAA2222),
             description=description[:4000])
         await i.response.send_message(embed=embed, ephemeral=True)
@@ -557,8 +560,8 @@ class GmPanelView(discord.ui.View):
             embed = discord.Embed(
                 title="GM Map - All Unit Positions",
                 description=(
-                    "🧦 **Blue labels** = player unit names (Ã¢â€ â€™dest if in transit)\n"
-                    "🧥 **Red labels** = enemy units (#ID + type)"
+                    "🔵 **Blue labels** = player unit names (→dest if in transit)\n"
+                    "🔴 **Red labels** = enemy units (#ID + type)"
                 ),
                 color=0x226622,
             )
@@ -742,9 +745,9 @@ class GmPanelPagerView(_PagedPanelView):
         pages = [
             {
                 "title": "GM Panel / Contract",
-                "description": "Start, pause, conclude, and inspect the current theatre.",
+                "description": "Create contracts for the board, lock/assign fleets, conclude, and inspect. Use **Create Contract** first — it posts to the board without wiping data.",
                 "items": [
-                    {"label": "Start Contract", "method": "start_contract", "style": discord.ButtonStyle.success},
+                    {"label": "Create Contract", "method": "start_contract", "style": discord.ButtonStyle.success},
                     {"label": "Pause Contract", "method": "pause_contract"},
                     {"label": "Lock Acceptance", "method": "lock_contract_acceptance"},
                     {"label": "Assign Fleets", "method": "assign_contract_fleets", "style": discord.ButtonStyle.primary},
@@ -1003,7 +1006,7 @@ class _PlanetRemoveModal(discord.ui.Modal, title="Remove Planet"):
         await _refresh_public_surfaces(i.client, i.guild_id)
 
 
-# Planet Edit — two-step: pick field then enter value
+# Planet Edit — two-step: pick field then enter value
 PLANET_EDIT_FIELDS = {
     "name":        "Planet Name",
     "contractor":  "Contractor",
@@ -1035,7 +1038,7 @@ class _PlanetEditModal(discord.ui.Modal, title="Edit Planet"):
     new_value   = discord.ui.TextInput(label="New Value",   max_length=80)
 
     def __init__(self, field: str, field_label: str):
-        super().__init__(title=f"Edit Planet — {field_label}")
+        super().__init__(title=f"Edit Planet — {field_label}")
         self.field = field
 
     async def on_submit(self, i: discord.Interaction):
@@ -1052,7 +1055,7 @@ class _PlanetEditModal(discord.ui.Modal, title="Edit Planet"):
                 f"UPDATE planets SET {self.field}=$1 WHERE guild_id=$2 AND id=$3",
                 val, i.guild_id, planet["id"])
         await i.response.send_message(
-            f"**{name}** — {PLANET_EDIT_FIELDS[self.field]} updated to `{val}`.", ephemeral=True)
+            f"**{name}** — {PLANET_EDIT_FIELDS[self.field]} updated to `{val}`.", ephemeral=True)
         await _refresh_public_surfaces(i.client, i.guild_id)
 
 
@@ -1089,7 +1092,7 @@ class _ThemeSetModal(discord.ui.Modal, title="Set Theme"):
     value = discord.ui.TextInput(label="New Value", max_length=80)
 
     def __init__(self, field: str, field_label: str):
-        super().__init__(title=f"Set — {field_label}")
+        super().__init__(title=f"Set — {field_label}")
         self.field = field
 
     async def on_submit(self, i: discord.Interaction):
@@ -1128,7 +1131,7 @@ class _ThemeColorModal(discord.ui.Modal, title="Set Accent Color"):
         await _refresh_public_surfaces(i.client, i.guild_id, maps=False)
 
 
-# Terrain — two-step: pick terrain type then enter hex
+# Terrain — two-step: pick terrain type then enter hex
 class _TerrainTypeView(discord.ui.View):
     def __init__(self, guild_id: int):
         super().__init__(timeout=60)
@@ -1154,7 +1157,7 @@ class _TerrainHexModal(discord.ui.Modal, title="Set Terrain"):
         max_length=12, required=True)
 
     def __init__(self, terrain: str):
-        super().__init__(title=f"Set Terrain — {terrain.title()}")
+        super().__init__(title=f"Set Terrain — {terrain.title()}")
         self.terrain = terrain
 
     async def on_submit(self, i: discord.Interaction):
@@ -1175,7 +1178,7 @@ class _TerrainHexModal(discord.ui.Modal, title="Set Terrain"):
         await _refresh_public_surfaces(i.client, i.guild_id)
 
 
-# Channels — generic modal that resolves channel by ID or mention
+# Channels — generic modal that resolves channel by ID or mention
 class _ChannelModal(discord.ui.Modal, title="Set Channel"):
     channel_input = discord.ui.TextInput(
         label="Channel ID or #mention",
@@ -1383,7 +1386,10 @@ class _ContractBoardSetupModal(discord.ui.Modal, title="Contract Board Settings"
 
 
 # GM Modals
-class _StartContractModal(discord.ui.Modal, title="Start Contract"):
+class _CreateContractModal(discord.ui.Modal, title="Create Contract"):
+    """Creates a contract entry on the board. Players can then accept it.
+    The GM assigns fleets separately, which opens deployment."""
+
     contract_name = discord.ui.TextInput(
         label="Contract Name",
         placeholder="e.g. Operation Iron Dawn",
@@ -1391,7 +1397,7 @@ class _StartContractModal(discord.ui.Modal, title="Start Contract"):
         required=True,
     )
     rp_description = discord.ui.TextInput(
-        label="Roleplay Description / Briefing",
+        label="Briefing / Description",
         placeholder="Describe the contract, objectives, and what operatives must accomplish...",
         style=discord.TextStyle.paragraph,
         max_length=1000,
@@ -1412,64 +1418,48 @@ class _StartContractModal(discord.ui.Modal, title="Start Contract"):
             planet    = await conn.fetchrow(
                 "SELECT name, contractor, enemy_type FROM planets WHERE guild_id=$1 AND id=$2",
                 i.guild_id, planet_id)
-            await ensure_hexes(i.guild_id, conn, planet_id)
-            for tbl in ("enemy_units", "combat_log",
-                        "turn_history", "enemy_gm_moves", "movement_arrows"):
-                await conn.execute(
-                    f"DELETE FROM {tbl} WHERE guild_id=$1 AND planet_id=$2",
-                    i.guild_id, planet_id)
-            await conn.execute("""
-                UPDATE squadrons
-                SET is_active=FALSE,
-                    in_transit=FALSE,
-                    transit_destination=NULL,
-                    transit_turns_left=0,
-                    is_dug_in=FALSE,
-                    artillery_armed=FALSE,
-                    hexes_moved_this_turn=0
-                WHERE guild_id=$1 AND planet_id=$2
-            """, i.guild_id, planet_id)
+            # Insert the contract in 'accepting' state — no data wipe, no game reset.
+            # Players sign up via the contract board; the GM then assigns fleets to deploy.
             await conn.execute(
-                "UPDATE commander_profiles SET recovery_status=NULL, updated_at=NOW() "
-                "WHERE guild_id=$1",
-                i.guild_id)
-            await conn.execute(
-                "UPDATE hexes SET controller='neutral', status='neutral' "
-                "WHERE guild_id=$1 AND planet_id=$2",
-                i.guild_id, planet_id)
-            await conn.execute(
-                "UPDATE guild_config SET game_started=FALSE, contract_name=$1 WHERE guild_id=$2",
-                name, i.guild_id)
-            await conn.execute(
-                "INSERT INTO contracts (guild_id,title,planet_system,enemy,difficulty,description,status,fleet_count,deployment_capacity,created_by_gm) VALUES ($1,$2,$3,$4,'standard',$5,$6,$7,$8,$9)",
-                i.guild_id, name, (planet['name'] if planet else 'Unknown'), (planet['enemy_type'] if planet else 'Unknown'), desc,
-                'accepting', 0, 0, i.user.id
+                "INSERT INTO contracts "
+                "(guild_id, title, planet_system, enemy, difficulty, description, "
+                " status, fleet_count, deployment_capacity, created_by_gm) "
+                "VALUES ($1,$2,$3,$4,'standard',$5,'accepting',0,0,$6)",
+                i.guild_id,
+                name,
+                planet["name"]       if planet else "Unknown",
+                planet["enemy_type"] if planet else "Unknown",
+                desc,
+                i.user.id,
             )
             theme = await get_theme(conn, i.guild_id)
-            # Post to announcement channel if set
-            cfg = await conn.fetchrow(
+            cfg   = await conn.fetchrow(
                 "SELECT announcement_channel_id FROM guild_config WHERE guild_id=$1", i.guild_id)
         await i.response.send_message(
-            f"Ã¢Å“â€¦ **Contract: {name}** has started!", ephemeral=True)
+            f"✅ **Contract '{name}'** posted to the board. Players can now accept it.\n"
+            f"Use **Assign Fleets** when ready to open deployment.",
+            ephemeral=True)
         await _refresh_public_surfaces(self.bot, i.guild_id)
         if cfg and cfg["announcement_channel_id"]:
             channel = i.guild.get_channel(cfg["announcement_channel_id"])
             if channel:
                 embed = discord.Embed(
-                    title=f"Ã°Å¸â€œÅ“ Contract: {name}",
+                    title=f"📋 New Contract: {name}",
                     color=theme.get("color", 0xAA2222),
                     description=(
                         f"{desc}\n\n"
-                        f"**Planet:** {planet['name'] if planet else '—'}\n"
-                        f"**Contractor:** {planet['contractor'] if planet else '—'}\n"
-                        f"**Enemy:** {planet['enemy_type'] if planet else '—'}\n\n"
-                        f"**Fleets Assigned:** 0\n"
-                        f"**Deployment Capacity:** 0 units\n\n"
-                        f"*Commandants may accept this contract. Deployment opens after GM fleet assignment.*"
+                        f"**Planet:** {planet['name'] if planet else '—'}\n"
+                        f"**Contractor:** {planet['contractor'] if planet else '—'}\n"
+                        f"**Enemy:** {planet['enemy_type'] if planet else '—'}\n\n"
+                        f"*Commandants may now accept this contract via the contract board.*\n"
+                        f"*Deployment opens once the GM assigns fleets.*"
                     ),
                 )
                 embed.set_footer(text=theme.get("flavor_text", "The contract must be fulfilled."))
                 await channel.send(embed=embed)
+
+# Kept for backwards compatibility if referenced elsewhere — redirects to _CreateContractModal.
+_StartContractModal = _CreateContractModal
 
 
 class _PauseContractModal(discord.ui.Modal, title="Pause Contract"):
@@ -1572,7 +1562,7 @@ class _ContractOutcomeModal(discord.ui.Modal, title="Conclude Contract"):
     )
     rp_description = discord.ui.TextInput(
         label="Roleplay Outcome Description",
-        placeholder="Describe what happened — did the operatives fulfil the contract in time?",
+        placeholder="Describe what happened — did the operatives fulfil the contract in time?",
         style=discord.TextStyle.paragraph,
         max_length=1200,
         required=True,
@@ -1637,7 +1627,7 @@ class _ContractOutcomeModal(discord.ui.Modal, title="Conclude Contract"):
             channel = i.guild.get_channel(cfg["announcement_channel_id"])
             if channel:
                 embed = discord.Embed(
-                    title=f"{icon} {label} — {contract_name}",
+                    title=f"{icon} {label} — {contract_name}",
                     color=0x22AA44 if success else 0xAA2222,
                     description=desc + f"\n\nOperational Tempo +{tempo_gain} -> {tempo_result['tempo']}/{tempo_result['threshold']}",
                 )
@@ -1645,7 +1635,7 @@ class _ContractOutcomeModal(discord.ui.Modal, title="Conclude Contract"):
                 await channel.send(embed=embed)
         else:
             await i.followup.send(
-                "Ã¢Å¡Â  No announcement channel set. Use Admin Panel Ã¢â€ â€™ Announcement Channel to configure one.",
+                "⚠️ No announcement channel set. Use Admin Panel → Announcement Channel to configure one.",
                 ephemeral=True)
 
 
@@ -1680,7 +1670,7 @@ class _SpawnEnemyModal(discord.ui.Modal, title="Spawn Enemy Unit"):
             except Exception:
                 pass
         await i.response.send_message(
-            f"Ã°Å¸â€˜Â¾ **{str(self.unit_type).strip()}** spawned at `{addr}` with **{hp} HP**.", ephemeral=True)
+            f"👾 **{str(self.unit_type).strip()}** spawned at `{addr}` with **{hp} HP**.", ephemeral=True)
         await _refresh_public_surfaces(i.client, i.guild_id)
 
 
@@ -1834,13 +1824,13 @@ class _BulkMoveEnemyModal(discord.ui.Modal, title="Bulk Queue Enemy Moves"):
                     ON CONFLICT (guild_id, enemy_unit_id)
                     DO UPDATE SET target_address=EXCLUDED.target_address
                 """, i.guild_id, planet_id, uid, addr)
-                successes.append(f"Unit **{uid}** Ã¢â€ â€™ `{addr}`")
+                successes.append(f"Unit **{uid}** → `{addr}`")
 
         parts_out = []
         if successes:
-            parts_out.append(f"Ã¢Å“â€¦ Queued {len(successes)} move(s):\n" + "\n".join(successes))
+            parts_out.append(f"✅ Queued {len(successes)} move(s):\n" + "\n".join(successes))
         if errors:
-            parts_out.append(f"Ã¢Å¡Â  {len(errors)} error(s):\n" + "\n".join(errors))
+            parts_out.append(f"⚠️ {len(errors)} error(s):\n" + "\n".join(errors))
         msg = "\n\n".join(parts_out) or "Nothing processed."
         await i.response.send_message(msg[:2000], ephemeral=True)
 
@@ -1899,7 +1889,7 @@ class _ConfirmView(discord.ui.View):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# COG — only two slash commands remain: /admin_panel and /gm_panel
+# COG — only two slash commands remain: /admin_panel and /gm_panel
 # ════════════════════════════════════════════════════════════════════════════
 
 class AdminCog(commands.Cog):
