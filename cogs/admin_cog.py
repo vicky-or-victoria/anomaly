@@ -779,6 +779,8 @@ class AdminPanelPagerView(_PagedPanelView):
                     {"label": "Status", "method": "game_status"},
                     {"label": "Turn Interval", "method": "set_turn_interval"},
                     {"label": "Force Turn", "method": "force_turn", "style": discord.ButtonStyle.danger},
+                    {"label": "➕ Add Fleets", "method": "add_fleets", "style": discord.ButtonStyle.success},
+                    {"label": "➖ Remove Fleets", "method": "remove_fleets", "style": discord.ButtonStyle.danger},
                     {"label": "🗑️ Reset Menu", "method": "game_reset", "style": discord.ButtonStyle.danger},
                 ],
             },
