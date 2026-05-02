@@ -1072,36 +1072,53 @@ def _draw_overview_orbit_map(draw, planets, active_planet_id, box, fonts, moons_
         # Draw moons orbiting this planet
         planet_id = _overview_value(planet, "id")
         moons = moons_by_planet.get(planet_id, [])
-        planet_r = 16 if is_active else (13 if has_contract else 10)
-        # Moon orbit: fixed absolute radius so moons always sit below the planet,
-        # well clear of the rightward name/status text (which starts at x+r+11 going right).
-        # We use straight-down (pi/2) as the base direction so moons never enter
-        # the rightward label zone regardless of where the planet sits on the canvas.
-        moon_orbit = 48
-        for m_idx, moon_name in enumerate(moons[:4]):
-            # Centre moons directly below the planet, spread symmetrically for multiple moons
-            spread = math.pi * 0.22  # ~40 degrees between moons
-            m_angle = math.pi / 2 + (m_idx - (len(moons) - 1) / 2.0) * spread
-            mx = int(px + math.cos(m_angle) * moon_orbit)
-            my = int(py + math.sin(m_angle) * moon_orbit)
-            mr = 4
-            # Faint orbit ring around the planet
+        if moons:
+            planet_r = 16 if is_active else (13 if has_contract else 10)
+            moon_orbit = 46
+
+            # Obstacles to avoid: sun node, and the planet label zone (text extends right)
+            obstacles = [
+                (cx, cy, 52),
+                (px + planet_r + 80, py + 10, 40),
+            ]
+
+            def _angle_score(a, px=px, py=py, mo=moon_orbit, obs=obstacles):
+                mx = px + math.cos(a) * mo
+                my = py + math.sin(a) * mo
+                score = float("inf")
+                for ox, oy, clearance in obs:
+                    d = math.hypot(mx - ox, my - oy) - clearance
+                    score = min(score, d)
+                return score
+
+            best_base = max(
+                (k * math.pi / 36 for k in range(72)),
+                key=_angle_score
+            )
+
             draw.ellipse((px - moon_orbit, py - moon_orbit, px + moon_orbit, py + moon_orbit),
                          outline=(38, 38, 48), width=1)
-            if is_active:
-                # Main Base moon: concentric glow rings — the visual "special" marker
-                for grow, lum in [(10, 38), (7, 62), (4, 100)]:
-                    draw.ellipse((mx - mr - grow, my - mr - grow,
-                                  mx + mr + grow, my + mr + grow),
-                                 outline=(lum, lum + 10, lum + 30), width=1)
-                draw.ellipse((mx - mr, my - mr, mx + mr, my + mr),
-                             fill=(200, 210, 230), outline=(240, 245, 255), width=2)
-            else:
-                draw.ellipse((mx - mr, my - mr, mx + mr, my + mr),
-                             fill=(72, 72, 76), outline=(140, 140, 148), width=1)
-            # Label centred below the moon dot
-            _overview_text(draw, (mx - 20, my + mr + 4), moon_name, fonts["mono"],
-                           (200, 210, 230) if is_active else (108, 108, 116), max_width=80)
+
+            spread = math.pi * 0.22
+            for m_idx, moon_name in enumerate(moons[:4]):
+                m_angle = best_base + (m_idx - (len(moons) - 1) / 2.0) * spread
+                mx = int(px + math.cos(m_angle) * moon_orbit)
+                my = int(py + math.sin(m_angle) * moon_orbit)
+                mr = 4
+                if is_active:
+                    for grow, lum in [(10, 38), (7, 62), (4, 100)]:
+                        draw.ellipse((mx - mr - grow, my - mr - grow,
+                                      mx + mr + grow, my + mr + grow),
+                                     outline=(lum, lum + 10, lum + 30), width=1)
+                    draw.ellipse((mx - mr, my - mr, mx + mr, my + mr),
+                                 fill=(200, 210, 230), outline=(240, 245, 255), width=2)
+                else:
+                    draw.ellipse((mx - mr, my - mr, mx + mr, my + mr),
+                                 fill=(72, 72, 76), outline=(140, 140, 148), width=1)
+                lx = int(px + math.cos(m_angle) * (moon_orbit + mr + 6))
+                ly = int(py + math.sin(m_angle) * (moon_orbit + mr + 6))
+                _overview_text(draw, (lx - 18, ly - 5), moon_name, fonts["mono"],
+                               (200, 210, 230) if is_active else (108, 108, 116), max_width=72)
 
 
 def _draw_overview_bottom_cards(draw, planets, active_planet_id, box, fonts):
