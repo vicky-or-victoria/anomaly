@@ -1299,16 +1299,26 @@ class _EnlistChannelModal(discord.ui.Modal, title="Set Enlist Channel"):
                 "SELECT name, contractor, enemy_type FROM planets WHERE guild_id=$1 AND id=$2",
                 i.guild_id, planet_id)
             count     = await conn.fetchval(
-                "SELECT COUNT(DISTINCT owner_id) FROM squadrons "
+                "SELECT COUNT(*) FROM commander_profiles "
                 "WHERE guild_id=$1",
                 i.guild_id) or 0
-            from views.menu import build_enlist_embed, EnlistView
+            from views.menu import build_enlist_embed, EnlistView, fetch_board_contracts
+            from utils.db import has_active_contracts
+            active_contracts = await fetch_board_contracts(conn, i.guild_id, limit=5)
+            active_enemies   = await conn.fetch(
+                "SELECT unit_type, hex_address, hp FROM enemy_units "
+                "WHERE guild_id=$1 AND planet_id=$2 AND is_active=TRUE ORDER BY id LIMIT 6",
+                i.guild_id, planet_id)
+            is_active = await has_active_contracts(conn, i.guild_id)
             embed = build_enlist_embed(
                 theme,
                 planet["name"]       if planet else "Unknown",
                 planet["contractor"] if planet else "---",
                 planet["enemy_type"] if planet else "---",
                 count,
+                list(active_contracts),
+                list(active_enemies),
+                contract_status="Active" if is_active else "Standby",
             )
         msg = await channel.send(embed=embed, view=EnlistView(i.guild_id))
         async with pool.acquire() as conn:
@@ -1341,10 +1351,13 @@ class _ContractBoardChannelModal(discord.ui.Modal, title="Set Contract Board Cha
         pool = await get_pool()
         async with pool.acquire() as conn:
             theme = await get_theme(conn, i.guild_id)
-            from views.menu import ContractBoardView, build_contract_board_embed, fetch_board_contracts
+            from views.menu import ContractBoardView, build_public_contract_board_embed, fetch_board_contracts
             rows = await fetch_board_contracts(conn, i.guild_id)
-            selected_id = rows[0]["id"] if rows else None
-            embed = build_contract_board_embed(theme, rows, selected_id)
+            active_enemies = await conn.fetch(
+                "SELECT unit_type, hex_address, hp FROM enemy_units "
+                "WHERE guild_id=$1 AND planet_id=$2 AND is_active=TRUE ORDER BY id LIMIT 8",
+                i.guild_id, await get_active_planet_id(conn, i.guild_id))
+            embed = build_public_contract_board_embed(theme, rows, list(active_enemies))
             cfg = await conn.fetchrow(
                 "SELECT contract_board_channel_id, contract_board_message_id FROM guild_config WHERE guild_id=$1",
                 i.guild_id)
@@ -1354,11 +1367,11 @@ class _ContractBoardChannelModal(discord.ui.Modal, title="Set Contract Board Cha
             if existing_channel:
                 try:
                     msg = await existing_channel.fetch_message(cfg["contract_board_message_id"])
-                    await msg.edit(embed=embed, view=ContractBoardView(i.guild_id, rows, selected_id))
+                    await msg.edit(embed=embed, view=None)
                 except Exception:
                     msg = None
         if msg is None:
-            msg = await channel.send(embed=embed, view=ContractBoardView(i.guild_id, rows, selected_id))
+            msg = await channel.send(embed=embed, view=None)
         async with pool.acquire() as conn:
             await conn.execute(
                 "UPDATE guild_config SET contract_board_channel_id=$1, contract_board_message_id=$2 WHERE guild_id=$3",
