@@ -1429,11 +1429,11 @@ class _ContractBoardChannelModal(discord.ui.Modal, title="Set Contract Board Cha
             if existing_channel:
                 try:
                     msg = await existing_channel.fetch_message(cfg["contract_board_message_id"])
-                    await msg.edit(embed=embed, view=None)
+                    await msg.edit(embed=embed, view=ContractBoardView(i.guild_id, rows))
                 except Exception:
                     msg = None
         if msg is None:
-            msg = await channel.send(embed=embed, view=None)
+            msg = await channel.send(embed=embed, view=ContractBoardView(i.guild_id, rows))
         async with pool.acquire() as conn:
             await conn.execute(
                 "UPDATE guild_config SET contract_board_channel_id=$1, contract_board_message_id=$2 WHERE guild_id=$3",

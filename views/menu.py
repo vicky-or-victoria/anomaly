@@ -564,13 +564,9 @@ async def _send_contract_board(i: discord.Interaction):
         )
 
     embed.description = "\n\n".join(lines)
-    embed.set_footer(text=f"{bot_name}  ·  {len(rows)} active contract(s)  ·  Select below for details and actions.")
+    embed.set_footer(text=f"{bot_name}  ·  {len(rows)} active contract(s)")
 
-    await i.response.send_message(
-        embed=embed,
-        view=ContractBoardView(i.guild_id, rows),
-        ephemeral=True,
-    )
+    await i.response.send_message(embed=embed, ephemeral=True)
 
 
 # ── Per-contract action view ───────────────────────────────────────────────────
@@ -1167,7 +1163,7 @@ async def refresh_enlist_counter(bot, guild_id: int, conn):
 
 
 async def refresh_contract_board(bot, guild_id: int, conn):
-    """Update the persistent live contract board — markdown list only, no interactive buttons."""
+    """Update the persistent live contract board — markdown list with interactive dropdown."""
     try:
         cfg = await conn.fetchrow(
             "SELECT contract_board_channel_id, contract_board_message_id "
@@ -1198,7 +1194,7 @@ async def refresh_contract_board(bot, guild_id: int, conn):
                 guild_id, active_pids))
 
         embed = build_public_contract_board_embed(theme, rows, active_enemies)
-        await msg.edit(embed=embed, view=None)
+        await msg.edit(embed=embed, view=ContractBoardView(guild_id, rows))
     except Exception as e:
         import logging
         logging.getLogger(__name__).warning(f"Contract board refresh failed: {e}")
