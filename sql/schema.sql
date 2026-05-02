@@ -413,3 +413,14 @@ DO $$ BEGIN
     WHERE LOWER(p.name) = 'terra prime'
     ON CONFLICT (guild_id, planet_id, name) DO NOTHING;
 END $$;
+-- v9: GM Auto-Spawn & Auto-AI ────────────────────────────────────────────────
+-- auto_spawn_enabled: whether the engine spawns AI enemies each turn
+-- auto_spawn_count:   how many enemies to spawn per turn
+-- auto_spawn_type:    unit type label to use when auto-spawning
+-- auto_spawn_hp:      HP for auto-spawned units
+-- auto_ai_enabled:    whether AI auto-moves and attacks player units each turn
+DO $$ BEGIN ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS auto_spawn_enabled BOOLEAN NOT NULL DEFAULT FALSE; END $$;
+DO $$ BEGIN ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS auto_spawn_count   INT     NOT NULL DEFAULT 1;     END $$;
+DO $$ BEGIN ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS auto_spawn_type    TEXT    NOT NULL DEFAULT 'Enemy'; END $$;
+DO $$ BEGIN ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS auto_spawn_hp      INT     NOT NULL DEFAULT 100;   END $$;
+DO $$ BEGIN ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS auto_ai_enabled    BOOLEAN NOT NULL DEFAULT FALSE; END $$;

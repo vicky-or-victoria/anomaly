@@ -720,6 +720,35 @@ class GmPanelView(discord.ui.View):
         if not await self._check(i): return
         await i.response.send_modal(_GrantCosmeticModal("badge", remove=True))
 
+    # ──── Row 3: Auto-Spawn & Auto-AI ──────────────────────────────────────────
+
+    @discord.ui.button(label="🤖 Auto-Spawn AI", style=discord.ButtonStyle.danger, row=3)
+    async def auto_spawn_toggle(self, i: discord.Interaction, b: discord.ui.Button):
+        """Configure and toggle automatic enemy spawning at the map edge each turn."""
+        if not await self._check(i): return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT auto_spawn_enabled, auto_spawn_count, auto_spawn_type, auto_spawn_hp "
+                "FROM guild_config WHERE guild_id=$1", i.guild_id)
+        current_enabled = row["auto_spawn_enabled"] if row else False
+        current_count   = row["auto_spawn_count"]   if row else 1
+        current_type    = row["auto_spawn_type"]    if row else "Enemy"
+        current_hp      = row["auto_spawn_hp"]      if row else 100
+        await i.response.send_modal(
+            _AutoSpawnConfigModal(current_enabled, current_count, current_type, current_hp))
+
+    @discord.ui.button(label="🧠 Auto-AI Combat", style=discord.ButtonStyle.danger, row=3)
+    async def auto_ai_toggle(self, i: discord.Interaction, b: discord.ui.Button):
+        """Toggle automatic AI movement and combat against player units each turn."""
+        if not await self._check(i): return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT auto_ai_enabled FROM guild_config WHERE guild_id=$1", i.guild_id)
+        current = row["auto_ai_enabled"] if row else False
+        await i.response.send_modal(_AutoAIConfigModal(current))
+
 
 class _AdminCosmeticView(discord.ui.View):
     def __init__(self, bot, guild_id: int):
@@ -911,6 +940,20 @@ class GmPanelPagerView(_PagedPanelView):
                     {"label": "Remove Banner", "method": "remove_banner"},
                     {"label": "Grant Badge", "method": "grant_badge", "style": discord.ButtonStyle.primary},
                     {"label": "Remove Badge", "method": "remove_badge"},
+                ],
+            },
+            {
+                "title": "GM Panel / Automation",
+                "description": (
+                    "**🤖 Auto-Spawn AI** — spawns a configurable number of AI enemies per turn "
+                    "at random hexes on the outer edge of the map.\n\n"
+                    "**🧠 Auto-AI Combat** — AI enemies automatically move toward and attack "
+                    "player units each turn without GM intervention.\n\n"
+                    "Both features can be toggled on/off independently."
+                ),
+                "items": [
+                    {"label": "🤖 Auto-Spawn AI", "method": "auto_spawn_toggle", "style": discord.ButtonStyle.danger},
+                    {"label": "🧠 Auto-AI Combat", "method": "auto_ai_toggle",   "style": discord.ButtonStyle.danger},
                 ],
             },
         ]
@@ -2290,6 +2333,110 @@ class _BulkSpawnEnemyModal(discord.ui.Modal, title="Bulk Spawn Enemy Units"):
             parts_out.extend(errors[:10])
         await i.response.send_message("\n".join(parts_out)[:2000], ephemeral=True)
         await _refresh_public_surfaces(i.client, i.guild_id)
+
+
+class _AutoSpawnConfigModal(discord.ui.Modal, title="Configure Auto-Spawn AI"):
+    """Modal for enabling/configuring automatic AI spawning each turn."""
+
+    def __init__(self, current_enabled: bool, current_count: int, current_type: str, current_hp: int):
+        super().__init__()
+        self._current_enabled = current_enabled
+
+    enabled_input = discord.ui.TextInput(
+        label="Enable Auto-Spawn? (yes / no)",
+        placeholder="yes  or  no",
+        max_length=3,
+    )
+    count_input = discord.ui.TextInput(
+        label="Enemies to spawn per turn",
+        placeholder="e.g. 2",
+        max_length=3,
+        required=False,
+    )
+    type_input = discord.ui.TextInput(
+        label="Unit type label",
+        placeholder="e.g. Scout, Raider, Drone",
+        max_length=40,
+        required=False,
+    )
+    hp_input = discord.ui.TextInput(
+        label="HP per spawned unit (default 100)",
+        placeholder="e.g. 100",
+        max_length=5,
+        required=False,
+    )
+
+    async def on_submit(self, i: discord.Interaction):
+        raw_enabled = str(self.enabled_input).strip().lower()
+        if raw_enabled not in ("yes", "no", "y", "n", "true", "false", "1", "0", "on", "off"):
+            await i.response.send_message(
+                "Please enter **yes** or **no** for enable.", ephemeral=True)
+            return
+
+        enabled = raw_enabled in ("yes", "y", "true", "1", "on")
+
+        try:
+            count = max(1, min(20, int(str(self.count_input).strip()))) if str(self.count_input).strip() else 1
+        except ValueError:
+            count = 1
+
+        unit_type = str(self.type_input).strip()[:40] or "Enemy"
+
+        try:
+            hp = max(1, int(str(self.hp_input).strip())) if str(self.hp_input).strip() else 100
+        except ValueError:
+            hp = 100
+
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE guild_config SET "
+                "auto_spawn_enabled=$1, auto_spawn_count=$2, "
+                "auto_spawn_type=$3, auto_spawn_hp=$4 "
+                "WHERE guild_id=$5",
+                enabled, count, unit_type, hp, i.guild_id)
+
+        status = "✅ **ENABLED**" if enabled else "⛔ **DISABLED**"
+        await i.response.send_message(
+            f"🤖 Auto-Spawn AI {status}\n"
+            f"• **{count}** `{unit_type}` unit(s) per turn — **{hp} HP** each\n"
+            f"• Spawn location: outer edge of the map (random ring hexes)",
+            ephemeral=True)
+
+
+class _AutoAIConfigModal(discord.ui.Modal, title="Configure Auto-AI Combat"):
+    """Modal for toggling automatic AI movement and combat."""
+
+    def __init__(self, current_enabled: bool):
+        super().__init__()
+        self._current_enabled = current_enabled
+
+    enabled_input = discord.ui.TextInput(
+        label="Enable Auto-AI Combat? (yes / no)",
+        placeholder="yes  or  no",
+        max_length=3,
+    )
+
+    async def on_submit(self, i: discord.Interaction):
+        raw = str(self.enabled_input).strip().lower()
+        if raw not in ("yes", "no", "y", "n", "true", "false", "1", "0", "on", "off"):
+            await i.response.send_message(
+                "Please enter **yes** or **no**.", ephemeral=True)
+            return
+
+        enabled = raw in ("yes", "y", "true", "1", "on")
+
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE guild_config SET auto_ai_enabled=$1 WHERE guild_id=$2",
+                enabled, i.guild_id)
+
+        status = "✅ **ENABLED**" if enabled else "⛔ **DISABLED**"
+        await i.response.send_message(
+            f"🧠 Auto-AI Combat {status}\n"
+            f"• AI enemies will {'automatically move toward and attack player units each turn' if enabled else 'remain stationary unless GM-moved'}.",
+            ephemeral=True)
 
 
 class _MoveEnemyModal(discord.ui.Modal, title="Queue Enemy Move"):

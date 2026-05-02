@@ -519,8 +519,54 @@ class TurnEngine:
     # ── Enemy AI ──────────────────────────────────────────────────────────────
 
     async def _enemy_ai(self, conn, guild_id, planet_id, summaries, theme, enemy_type, movement_arrows):
-        # AI spawning has been removed — only GMs may spawn enemy units.
-        # Existing units (not GM-moved this turn) move toward player positions automatically.
+        # ── Step 1: Auto-spawn (if enabled) ───────────────────────────────────
+        cfg = await conn.fetchrow(
+            "SELECT auto_spawn_enabled, auto_spawn_count, auto_spawn_type, "
+            "auto_spawn_hp, auto_ai_enabled "
+            "FROM guild_config WHERE guild_id=$1",
+            guild_id)
+        auto_spawn  = cfg["auto_spawn_enabled"] if cfg else False
+        auto_ai     = cfg["auto_ai_enabled"]    if cfg else False
+
+        if auto_spawn:
+            spawn_count = max(1, min(20, cfg["auto_spawn_count"] or 1))
+            spawn_type  = (cfg["auto_spawn_type"] or "Enemy")[:40]
+            spawn_hp    = max(1, cfg["auto_spawn_hp"] or 100)
+
+            outer_ring  = outermost_hexes()
+            # Filter out hexes already occupied by enemy units
+            occupied = {r["hex_address"] for r in await conn.fetch(
+                "SELECT hex_address FROM enemy_units "
+                "WHERE guild_id=$1 AND planet_id=$2 AND is_active=TRUE",
+                guild_id, planet_id)}
+            candidates = [h for h in outer_ring if h not in occupied]
+            if not candidates:
+                candidates = outer_ring  # fall back if all edge hexes occupied
+
+            chosen_hexes = random.sample(candidates, min(spawn_count, len(candidates)))
+
+            def _rv():
+                return random.randint(-2, 2)
+
+            for hex_addr in chosen_hexes:
+                await conn.execute(
+                    "INSERT INTO enemy_units "
+                    "(guild_id, planet_id, unit_type, hex_address, "
+                    " attack, defense, speed, morale, supply, recon, hp) "
+                    "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+                    guild_id, planet_id, spawn_type, hex_addr,
+                    10 + _rv(), 10 + _rv(), 10 + _rv(),
+                    10 + _rv(), 10 + _rv(), 10 + _rv(), spawn_hp)
+                summaries.append(
+                    f"🤖 **{spawn_type}** auto-spawned at `{hex_addr}` "
+                    f"({spawn_hp} HP).")
+
+        # ── Step 2: Auto-AI movement (if enabled) ─────────────────────────────
+        # When auto_ai_enabled is FALSE, enemy units remain stationary unless
+        # the GM queued manual moves (handled in _gm_moves).
+        if not auto_ai:
+            return  # AI movement disabled — skip entirely
+
         units = await conn.fetch(
             "SELECT id, hex_address FROM enemy_units "
             "WHERE guild_id=$1 AND planet_id=$2 AND is_active=TRUE AND manually_moved=FALSE",
