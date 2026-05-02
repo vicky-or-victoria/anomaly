@@ -1069,3 +1069,354 @@ async def refresh_public_panels(bot, guild_id: int, conn):
     await update_menu_embed(bot, guild_id, conn)
     await refresh_enlist_counter(bot, guild_id, conn)
     await refresh_contract_board(bot, guild_id, conn)
+    # Fleet vote embed is heavy (renders system map) — fire-and-forget
+    try:
+        await refresh_fleet_vote_embed(bot, guild_id)
+    except Exception:
+        pass
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FLEET VOTE SYSTEM
+# Live global embed: system map + two dropdowns (fleet count & target contract)
+# Voting closes when ≥50% of active players agree on fleet+contract,
+# OR the GM manually concludes via Assign Fleets as before.
+# ══════════════════════════════════════════════════════════════════════════════
+
+MAX_VOTE_FLEETS = 8   # upper bound on the fleet-count dropdown
+
+
+async def build_fleet_vote_embed(guild_id: int, conn, theme: dict, map_buf=None) -> discord.Embed:
+    """
+    Build the public fleet-vote embed.  Two markdown sections:
+    • Tally of fleet-count votes
+    • Tally of contract-preference votes
+    The system map is attached separately as an image.
+    """
+    bot_name = theme.get("bot_name", "WARBOT")
+    color    = theme.get("color", 0xAA2222)
+
+    # ── Current pool state ────────────────────────────────────────────────
+    cfg = await conn.fetchrow(
+        "SELECT fleet_pool_available FROM guild_config WHERE guild_id=$1", guild_id)
+    available = (cfg["fleet_pool_available"] if cfg else 0) or 0
+
+    # ── All votes ─────────────────────────────────────────────────────────
+    votes = await conn.fetch(
+        "SELECT player_id, fleet_count, contract_id FROM fleet_votes WHERE guild_id=$1",
+        guild_id)
+    total_voters = len(votes)
+
+    # Fleet-count tally  {count: votes_for_it}
+    fleet_tally: dict[int, int] = {}
+    contract_tally: dict[int, int] = {}
+    for v in votes:
+        fc = v["fleet_count"]
+        fleet_tally[fc] = fleet_tally.get(fc, 0) + 1
+        cid = v["contract_id"]
+        if cid is not None:
+            contract_tally[cid] = contract_tally.get(cid, 0) + 1
+
+    # ── Contract info ─────────────────────────────────────────────────────
+    rows = await conn.fetch(
+        """
+        SELECT id, title, status, fleet_count, deployment_capacity, deployed_units
+        FROM contracts
+        WHERE guild_id=$1 AND status = ANY($2::text[])
+        ORDER BY id DESC LIMIT 10
+        """,
+        guild_id, list(("open", "accepting", "locked", "deployable", "active")))
+
+    # ── Fleet count section ────────────────────────────────────────────────
+    fleet_lines = []
+    if fleet_tally:
+        for fc in sorted(fleet_tally, key=lambda k: -fleet_tally[k]):
+            count = fleet_tally[fc]
+            pct   = int(100 * count / total_voters) if total_voters else 0
+            bar   = "█" * (pct // 10) + "░" * (10 - pct // 10)
+            fleet_lines.append(f"**{fc}** fleet(s)  `{bar}` {count} vote(s)  ({pct}%)")
+    else:
+        fleet_lines.append("*No votes cast yet.*")
+
+    fleet_section = "\n".join(fleet_lines)
+
+    # ── Contract preference section ────────────────────────────────────────
+    contract_lines = []
+    contract_map   = {r["id"]: r for r in rows}
+    if contract_tally:
+        for cid in sorted(contract_tally, key=lambda k: -contract_tally[k]):
+            count   = contract_tally[cid]
+            pct     = int(100 * count / total_voters) if total_voters else 0
+            bar     = "█" * (pct // 10) + "░" * (10 - pct // 10)
+            c_title = contract_map.get(cid, {}).get("title", f"#{cid}")
+            status  = contract_map.get(cid, {}).get("status", "?")
+            icon    = _status_icon(status)
+            contract_lines.append(
+                f"{icon} **#{cid:03d} — {c_title}**  `{bar}` {count} vote(s)  ({pct}%)")
+    else:
+        contract_lines.append("*No contract preference votes yet.*")
+
+    contract_section = "\n".join(contract_lines)
+
+    # ── Leading vote check ────────────────────────────────────────────────
+    threshold_note = ""
+    if total_voters >= 2:
+        top_fc  = max(fleet_tally, key=lambda k: fleet_tally[k]) if fleet_tally else None
+        top_cid = max(contract_tally, key=lambda k: contract_tally[k]) if contract_tally else None
+        if top_fc and top_cid:
+            fc_pct  = fleet_tally[top_fc] / total_voters
+            cid_pct = contract_tally[top_cid] / total_voters
+            if fc_pct >= 0.5 and cid_pct >= 0.5:
+                c_title = contract_map.get(top_cid, {}).get("title", f"#{top_cid}")
+                threshold_note = (
+                    f"\n\n🗳️  **MAJORITY REACHED** — "
+                    f"**{top_fc}** fleet(s) → **#{top_cid:03d} {c_title}**\n"
+                    f"*The GM should now use Assign Fleets to execute this vote.*"
+                )
+
+    embed = discord.Embed(
+        title=f"⚓  Fleet Commitment Vote  ·  {bot_name}",
+        color=color,
+        description=(
+            f"**{available}** fleet(s) available in the pool  ·  **{total_voters}** commander(s) voted\n"
+            f"*Use the dropdowns below to cast or update your vote.*"
+            f"{threshold_note}"
+        ),
+    )
+
+    embed.add_field(
+        name="🚢  How many fleets should we commit?",
+        value=fleet_section,
+        inline=False,
+    )
+    embed.add_field(
+        name="📋  Which contract should the fleets go to?",
+        value=contract_section,
+        inline=False,
+    )
+
+    if map_buf is None:
+        embed.set_footer(text=f"{bot_name}  ·  Majority (≥50%) on both choices triggers a GM alert.")
+    else:
+        embed.set_image(url="attachment://system_map.png")
+        embed.set_footer(text=f"{bot_name}  ·  System map updates automatically  ·  Majority (≥50%) on both choices triggers a GM alert.")
+
+    return embed
+
+
+class FleetCountSelect(discord.ui.Select):
+    """Dropdown: how many fleets should we commit?"""
+
+    def __init__(self, available: int):
+        cap = min(available, MAX_VOTE_FLEETS) if available > 0 else MAX_VOTE_FLEETS
+        options = [
+            discord.SelectOption(label=f"{n} fleet(s)", value=str(n),
+                                 description="Commit this many fleets to the chosen contract")
+            for n in range(1, cap + 1)
+        ]
+        if not options:
+            options = [discord.SelectOption(label="No fleets available", value="0")]
+        super().__init__(
+            placeholder="🚢  Vote: how many fleets to commit?",
+            options=options,
+            custom_id="fleet_vote_count",
+            row=0,
+        )
+
+    async def callback(self, i: discord.Interaction):
+        chosen = int(self.values[0])
+        pool   = await get_pool()
+        async with pool.acquire() as conn:
+            available = await conn.fetchval(
+                "SELECT fleet_pool_available FROM guild_config WHERE guild_id=$1", i.guild_id) or 0
+            if chosen > available:
+                await i.response.send_message(
+                    f"Only **{available}** fleet(s) are in the pool right now.", ephemeral=True)
+                return
+            await conn.execute(
+                """
+                INSERT INTO fleet_votes (guild_id, player_id, fleet_count)
+                VALUES ($1,$2,$3)
+                ON CONFLICT (guild_id, player_id)
+                DO UPDATE SET fleet_count=$3, voted_at=NOW()
+                """,
+                i.guild_id, i.user.id, chosen)
+        await i.response.send_message(
+            f"✅ Vote recorded: **{chosen}** fleet(s).", ephemeral=True)
+        # Refresh the global embed
+        try:
+            await refresh_fleet_vote_embed(i.client, i.guild_id)
+        except Exception:
+            pass
+
+
+class FleetContractSelect(discord.ui.Select):
+    """Dropdown: which contract should the fleets be assigned to?"""
+
+    def __init__(self, rows):
+        options = []
+        for c in rows[:25]:
+            icon = _status_icon(c["status"])
+            options.append(discord.SelectOption(
+                label=f"{icon} #{c['id']:03d} {c['title']}"[:100],
+                value=str(c["id"]),
+                description=f"{c['status'].title()} · {c['planet_system']} · vs {c['enemy']}"[:100],
+            ))
+        if not options:
+            options = [discord.SelectOption(label="No contracts available", value="0")]
+        super().__init__(
+            placeholder="📋  Vote: which contract gets the fleets?",
+            options=options,
+            custom_id="fleet_vote_contract",
+            row=1,
+        )
+
+    async def callback(self, i: discord.Interaction):
+        chosen = int(self.values[0])
+        if chosen == 0:
+            await i.response.send_message("No contracts to vote on yet.", ephemeral=True)
+            return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            c = await conn.fetchrow(
+                "SELECT id, title FROM contracts WHERE guild_id=$1 AND id=$2",
+                i.guild_id, chosen)
+            if not c:
+                await i.response.send_message("Contract not found.", ephemeral=True)
+                return
+            await conn.execute(
+                """
+                INSERT INTO fleet_votes (guild_id, player_id, fleet_count, contract_id)
+                VALUES ($1,$2,1,$3)
+                ON CONFLICT (guild_id, player_id)
+                DO UPDATE SET contract_id=$3, voted_at=NOW()
+                """,
+                i.guild_id, i.user.id, chosen)
+        await i.response.send_message(
+            f"✅ Vote recorded: **#{c['id']:03d} — {c['title']}**.", ephemeral=True)
+        try:
+            await refresh_fleet_vote_embed(i.client, i.guild_id)
+        except Exception:
+            pass
+
+
+class FleetVoteView(View):
+    """
+    Persistent view attached to the global fleet-vote embed.
+    Row 0: fleet-count dropdown
+    Row 1: contract dropdown
+    """
+
+    def __init__(self, guild_id: int, available: int, rows):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+        self.add_item(FleetCountSelect(available))
+        self.add_item(FleetContractSelect(rows))
+
+    @discord.ui.button(label="🗑️ Clear My Vote", style=discord.ButtonStyle.secondary,
+                       custom_id="fleet_vote_clear", row=2)
+    async def clear_vote(self, i: discord.Interaction, b: discord.ui.Button):
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM fleet_votes WHERE guild_id=$1 AND player_id=$2",
+                i.guild_id, i.user.id)
+        await i.response.send_message("🗑️ Your vote has been cleared.", ephemeral=True)
+        try:
+            await refresh_fleet_vote_embed(i.client, i.guild_id)
+        except Exception:
+            pass
+
+
+async def refresh_fleet_vote_embed(bot, guild_id: int, conn=None):
+    """Re-render and edit the persistent fleet-vote message (with system map)."""
+    from utils.db import get_pool as _gp
+    _pool = await _gp()
+    async with _pool.acquire() as _conn:
+        cfg = await _conn.fetchrow(
+            "SELECT fleet_vote_channel_id, fleet_vote_message_id, fleet_pool_available "
+            "FROM guild_config WHERE guild_id=$1", guild_id)
+        if not cfg or not cfg["fleet_vote_channel_id"] or not cfg["fleet_vote_message_id"]:
+            return
+        channel = bot.get_channel(cfg["fleet_vote_channel_id"])
+        if not channel:
+            return
+        try:
+            msg = await channel.fetch_message(cfg["fleet_vote_message_id"])
+        except Exception:
+            return
+
+        theme     = await get_theme(_conn, guild_id)
+        available = cfg["fleet_pool_available"] or 0
+        rows = await _conn.fetch(
+            """
+            SELECT c.id, c.title, c.status, c.planet_system, c.enemy,
+                   c.fleet_count, c.deployment_capacity, c.deployed_units
+            FROM contracts c
+            WHERE c.guild_id=$1 AND c.status = ANY($2::text[])
+            ORDER BY c.id DESC LIMIT 10
+            """,
+            guild_id, list(("open", "accepting", "locked", "deployable", "active")))
+
+        # Render the system overview map
+        map_file = None
+        map_buf  = None
+        try:
+            from utils.map_render import render_overview_for_guild
+            map_buf  = await render_overview_for_guild(guild_id, _conn)
+            map_file = discord.File(map_buf, filename="system_map.png")
+        except Exception:
+            pass
+
+        embed = await build_fleet_vote_embed(guild_id, _conn, theme, map_buf=map_buf)
+        view  = FleetVoteView(guild_id, available, list(rows))
+
+        if map_file:
+            await msg.edit(embed=embed, view=view, attachments=[map_file])
+        else:
+            await msg.edit(embed=embed, view=view)
+
+
+async def post_fleet_vote_panel(bot, guild_id: int, channel) -> discord.Message:
+    """
+    Post a fresh fleet-vote panel to `channel`.
+    Saves channel_id + message_id to guild_config.
+    """
+    from utils.db import get_pool as _gp
+    _pool = await _gp()
+    async with _pool.acquire() as conn:
+        theme     = await get_theme(conn, guild_id)
+        available = await conn.fetchval(
+            "SELECT fleet_pool_available FROM guild_config WHERE guild_id=$1", guild_id) or 0
+        rows = await conn.fetch(
+            """
+            SELECT id, title, status, planet_system, enemy,
+                   fleet_count, deployment_capacity, deployed_units
+            FROM contracts
+            WHERE guild_id=$1 AND status = ANY($2::text[])
+            ORDER BY id DESC LIMIT 10
+            """,
+            guild_id, list(("open", "accepting", "locked", "deployable", "active")))
+
+        map_file = None
+        map_buf  = None
+        try:
+            from utils.map_render import render_overview_for_guild
+            map_buf  = await render_overview_for_guild(guild_id, conn)
+            map_file = discord.File(map_buf, filename="system_map.png")
+        except Exception:
+            pass
+
+        embed = await build_fleet_vote_embed(guild_id, conn, theme, map_buf=map_buf)
+        view  = FleetVoteView(guild_id, available, list(rows))
+
+    if map_file:
+        msg = await channel.send(embed=embed, view=view, file=map_file)
+    else:
+        msg = await channel.send(embed=embed, view=view)
+
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE guild_config SET fleet_vote_channel_id=$1, fleet_vote_message_id=$2 "
+            "WHERE guild_id=$3",
+            channel.id, msg.id, guild_id)
+    return msg

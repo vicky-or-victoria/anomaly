@@ -190,6 +190,12 @@ class AdminPanelView(discord.ui.View):
             await i.response.send_message("Admins only.", ephemeral=True); return
         await i.response.send_modal(_ContractBoardChannelModal(self.bot))
 
+    async def fleet_vote_channel_setup(self, i: discord.Interaction, b: discord.ui.Button = None):
+        """Set up the persistent fleet-vote embed channel."""
+        if not await _is_admin(self.bot, i):
+            await i.response.send_message("Admins only.", ephemeral=True); return
+        await i.response.send_modal(_FleetVoteChannelModal(self.bot))
+
     # ──── Row 1: Planets ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
     @discord.ui.button(label="🚪 List Planets", style=discord.ButtonStyle.secondary, row=1)
@@ -454,10 +460,37 @@ class GmPanelView(discord.ui.View):
 
     @discord.ui.button(label="📋 Create Contract", style=discord.ButtonStyle.success, row=0)
     async def start_contract(self, i: discord.Interaction, b: discord.ui.Button):
-        """Post a new contract to the board for players to accept.
+        """Post a new contract to the board — opens a planet selector first, then the details modal.
         Does NOT wipe war data — use Assign Fleets to open deployment."""
         if not await self._check(i): return
-        await i.response.send_modal(_CreateContractModal(self.bot))
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            active_id = await get_active_planet_id(conn, i.guild_id)
+            planets   = await conn.fetch(
+                "SELECT id, name, contractor, enemy_type FROM planets WHERE guild_id=$1 ORDER BY sort_order, id",
+                i.guild_id)
+        if not planets:
+            # No planets configured — fall back to modal with active planet
+            await i.response.send_modal(_CreateContractModal(self.bot))
+            return
+        planet_dicts = [
+            {**dict(p), "is_active": p["id"] == active_id}
+            for p in planets
+        ]
+        embed = discord.Embed(
+            title="📋  Create Contract — Select Planet",
+            description=(
+                "Choose which planetary theatre this contract is for.\n"
+                "★ marks the currently active planet.\n\n"
+                "The contract details modal will open after your selection."
+            ),
+            color=0xAA2222,
+        )
+        await i.response.send_message(
+            embed=embed,
+            view=_PlanetPickerView(self.bot, planet_dicts),
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="🔒 Lock Acceptance", style=discord.ButtonStyle.secondary, row=0)
     async def lock_contract_acceptance(self, i: discord.Interaction, b: discord.ui.Button):
@@ -768,6 +801,7 @@ class AdminPanelPagerView(_PagedPanelView):
                     {"label": "Menu Channel", "method": "set_menu_channel"},
                     {"label": "Enlist Channel", "method": "set_enlist_channel"},
                     {"label": "Contract Board Channel", "method": "contract_board_setup", "style": discord.ButtonStyle.primary},
+                    {"label": "⚓ Fleet Vote Channel", "method": "fleet_vote_channel_setup", "style": discord.ButtonStyle.primary},
                     {"label": "Report Channel", "method": "set_report_channel"},
                     {"label": "Announcement", "method": "set_announcement_channel"},
                     {"label": "Admin Role", "method": "set_admin_role"},
@@ -1379,6 +1413,33 @@ class _ContractBoardChannelModal(discord.ui.Modal, title="Set Contract Board Cha
         await i.response.send_message(f"Contract board posted in {msg.channel.mention}.", ephemeral=True)
 
 
+
+
+class _FleetVoteChannelModal(discord.ui.Modal, title="Set Fleet Vote Channel"):
+    channel_input = discord.ui.TextInput(
+        label="Channel ID",
+        placeholder="Paste the channel ID",
+        max_length=30, required=True)
+
+    def __init__(self, bot):
+        super().__init__()
+        self.bot = bot
+
+    async def on_submit(self, i: discord.Interaction):
+        raw = str(self.channel_input).strip().lstrip("<#").rstrip(">")
+        try:
+            channel_id = int(raw)
+        except ValueError:
+            await i.response.send_message("Please paste a valid channel ID.", ephemeral=True); return
+        channel = i.guild.get_channel(channel_id)
+        if not channel:
+            await i.response.send_message("Channel not found.", ephemeral=True); return
+        await ensure_guild(i.guild_id)
+        from views.menu import post_fleet_vote_panel
+        msg = await post_fleet_vote_panel(self.bot, i.guild_id, channel)
+        await i.response.send_message(
+            f"⚓ Fleet Vote panel posted in {channel.mention}.", ephemeral=True)
+
 class _RoleModal(discord.ui.Modal, title="Set Role"):
     role_input = discord.ui.TextInput(
         label="Role ID or @mention",
@@ -1438,6 +1499,42 @@ class _ContractBoardSetupModal(discord.ui.Modal, title="Contract Board Settings"
 
 
 # GM Modals
+class _PlanetPickerView(discord.ui.View):
+    """
+    First step of contract creation: GM picks which planet the contract is for.
+    Then the contract-details modal opens pre-filled with the chosen planet.
+    """
+    def __init__(self, bot, planets: list):
+        super().__init__(timeout=120)
+        self.bot = bot
+        select = discord.ui.Select(
+            placeholder="Select the planet / theatre for this contract...",
+            options=[
+                discord.SelectOption(
+                    label=f"{'★ ' if p.get('is_active') else ''}{p['name']}",
+                    value=str(p["id"]),
+                    description=f"Contractor: {p['contractor']}  ·  Enemy: {p['enemy_type']}"[:100],
+                )
+                for p in planets[:25]
+            ],
+        )
+        select.callback = self._on_select
+        self.add_item(select)
+
+    async def _on_select(self, i: discord.Interaction):
+        planet_id = int(i.data["values"][0])
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            planet = await conn.fetchrow(
+                "SELECT id, name, contractor, enemy_type FROM planets WHERE guild_id=$1 AND id=$2",
+                i.guild_id, planet_id)
+        if not planet:
+            await i.response.send_message("Planet not found.", ephemeral=True)
+            return
+        await i.response.send_modal(
+            _CreateContractModal(self.bot, planet["id"], dict(planet)))
+
+
 class _CreateContractModal(discord.ui.Modal, title="Create Contract"):
     """Creates a contract entry on the board. Players can then accept it.
     The GM assigns fleets separately, which opens deployment."""
@@ -1456,9 +1553,11 @@ class _CreateContractModal(discord.ui.Modal, title="Create Contract"):
         required=True,
     )
 
-    def __init__(self, bot):
+    def __init__(self, bot, planet_id: int = None, planet: dict = None):
         super().__init__()
-        self.bot = bot
+        self.bot       = bot
+        self.planet_id = planet_id
+        self.planet    = planet  # pre-selected planet dict {id, name, contractor, enemy_type}
 
     async def on_submit(self, i: discord.Interaction):
         name = str(self.contract_name).strip()
@@ -1466,10 +1565,17 @@ class _CreateContractModal(discord.ui.Modal, title="Create Contract"):
         await ensure_guild(i.guild_id)
         pool = await get_pool()
         async with pool.acquire() as conn:
-            planet_id = await get_active_planet_id(conn, i.guild_id)
-            planet    = await conn.fetchrow(
-                "SELECT name, contractor, enemy_type FROM planets WHERE guild_id=$1 AND id=$2",
-                i.guild_id, planet_id)
+            # Use pre-selected planet, or fall back to active planet
+            if self.planet_id:
+                planet_id = self.planet_id
+                planet    = self.planet or await conn.fetchrow(
+                    "SELECT name, contractor, enemy_type FROM planets WHERE guild_id=$1 AND id=$2",
+                    i.guild_id, planet_id)
+            else:
+                planet_id = await get_active_planet_id(conn, i.guild_id)
+                planet    = await conn.fetchrow(
+                    "SELECT name, contractor, enemy_type FROM planets WHERE guild_id=$1 AND id=$2",
+                    i.guild_id, planet_id)
             # Insert the contract in 'accepting' state — no data wipe, no game reset.
             # Players sign up via the contract board; the GM then assigns fleets to deploy.
             await conn.execute(
@@ -1489,7 +1595,7 @@ class _CreateContractModal(discord.ui.Modal, title="Create Contract"):
             cfg   = await conn.fetchrow(
                 "SELECT announcement_channel_id FROM guild_config WHERE guild_id=$1", i.guild_id)
         await i.response.send_message(
-            f"✅ **Contract '{name}'** posted to the board. Players can now accept it.\n"
+            f"✅ **Contract '{name}'** posted to the board on **{planet['name'] if planet else '?'}**.\n"
             f"Use **Assign Fleets** when ready to open deployment.",
             ephemeral=True)
         await _refresh_public_surfaces(self.bot, i.guild_id)

@@ -368,3 +368,17 @@ CREATE TABLE IF NOT EXISTS planet_map_messages (
 
 -- Drop game_started dependency: derive active state from contracts instead
 -- (game_started kept for admin reset; no longer set by contract lifecycle)
+-- v7: Fleet Vote System ────────────────────────────────────────────────────
+-- Tracks the persistent fleet-vote embed (system map + voting dropdowns)
+DO $$ BEGIN ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS fleet_vote_channel_id  BIGINT DEFAULT NULL; END $$;
+DO $$ BEGIN ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS fleet_vote_message_id  BIGINT DEFAULT NULL; END $$;
+
+-- Stores individual player votes (fleet count & target contract)
+CREATE TABLE IF NOT EXISTS fleet_votes (
+    guild_id      BIGINT NOT NULL,
+    player_id     BIGINT NOT NULL,
+    fleet_count   INT    NOT NULL DEFAULT 1,   -- fleets this player votes to commit
+    contract_id   INT    DEFAULT NULL,          -- which contract they vote to assign to
+    voted_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (guild_id, player_id)
+);
