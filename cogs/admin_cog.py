@@ -312,7 +312,6 @@ class AdminPanelView(discord.ui.View):
         await i.response.send_message(
             "Choose terrain type:", view=_TerrainTypeView(i.guild_id), ephemeral=True)
 
-    @discord.ui.button(label="⛰️ Bulk Set Terrain", style=discord.ButtonStyle.primary, row=2)
     async def map_bulk_terrain(self, i: discord.Interaction, b: discord.ui.Button):
         """Bulk-set many hexes to one terrain type in a single operation."""
         if not await _is_admin(self.bot, i):
