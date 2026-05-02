@@ -92,7 +92,7 @@ def _admin_panel_embed(theme: dict) -> discord.Embed:
         color=theme.get("color", 0xAA2222),
         description=(
             "**Game Control**\n"
-            "Reset · Status · Turn Interval · **Force Turn**\n\n"
+            "Status · Turn Interval · Force Turn · **Reset Menu**\n\n"
             "**Planets**\n"
             "List · Add · Remove · Set Active · Edit\n\n"
             "**Theme & Appearance**\n"
@@ -121,32 +121,22 @@ class AdminPanelView(discord.ui.View):
 
     # ──── Row 0: Game Control ──────────────────────────────────────────────────────────────────────────────────────────────────────
 
-    @discord.ui.button(label="🗑️ Reset War", style=discord.ButtonStyle.danger, row=0)
+    @discord.ui.button(label="🗑️ Reset Menu", style=discord.ButtonStyle.danger, row=0)
     async def game_reset(self, i: discord.Interaction, b: discord.ui.Button):
+        """Open the tiered reset sub-panel."""
         if not await _is_admin(self.bot, i):
             await i.response.send_message("Admins only.", ephemeral=True); return
-        view = _ConfirmView(i.user.id)
-        await i.response.send_message(
-            "⚠️ This wipes **all** war data on the active planet. Confirm?",
-            view=view, ephemeral=True)
-        await view.wait()
-        if not view.confirmed:
-            return
         pool = await get_pool()
         async with pool.acquire() as conn:
-            planet_id = await get_active_planet_id(conn, i.guild_id)
-            for tbl in ("squadrons", "enemy_units", "combat_log", "turn_history", "enemy_gm_moves", "movement_arrows"):
-                await conn.execute(
-                    f"DELETE FROM {tbl} WHERE guild_id=$1 AND planet_id=$2",
-                    i.guild_id, planet_id)
-            await conn.execute(
-                "UPDATE hexes SET controller='neutral', status='neutral' "
-                "WHERE guild_id=$1 AND planet_id=$2", i.guild_id, planet_id)
-            await conn.execute(
-                "UPDATE guild_config SET game_started=FALSE, last_turn_at=NOW() "
-                "WHERE guild_id=$1", i.guild_id)
-        await i.edit_original_response(content="✅ War data cleared.", view=None)
-        await _refresh_public_surfaces(self.bot, i.guild_id)
+            planet = await conn.fetchrow(
+                "SELECT name FROM planets WHERE guild_id=$1 AND id=("
+                "  SELECT active_planet_id FROM guild_config WHERE guild_id=$1)",
+                i.guild_id)
+        planet_name = planet["name"] if planet else "Unknown"
+        await i.response.send_message(
+            embed=_reset_menu_embed(planet_name),
+            view=_ResetMenuView(self.bot, i.guild_id, i.user.id, planet_name),
+            ephemeral=True)
 
     @discord.ui.button(label="📋 Status", style=discord.ButtonStyle.secondary, row=0)
     async def game_status(self, i: discord.Interaction, b: discord.ui.Button):
@@ -495,7 +485,7 @@ class GmPanelView(discord.ui.View):
         if not await self._check(i): return
         await i.response.send_modal(_CancelContractModal(self.bot))
 
-    @discord.ui.button(label="📄 List Contracts", style=discord.ButtonStyle.secondary, row=0)
+    @discord.ui.button(label="📄 List Contracts", style=discord.ButtonStyle.secondary, row=1)
     async def list_contracts(self, i: discord.Interaction, b: discord.ui.Button):
         """Show all live contracts with their IDs, statuses, and fleet counts."""
         if not await self._check(i): return
@@ -591,12 +581,12 @@ class GmPanelView(discord.ui.View):
 
     # ──── Row 2: Misc ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-    @discord.ui.button(label="œ Remove Enemy", style=discord.ButtonStyle.danger, row=3)
+    @discord.ui.button(label="☠️ Remove Enemy", style=discord.ButtonStyle.danger, row=1)
     async def remove_enemy(self, i: discord.Interaction, b: discord.ui.Button):
         if not await self._check(i): return
         await i.response.send_modal(_RemoveEnemyModal())
 
-    @discord.ui.button(label="GM Map", style=discord.ButtonStyle.success, row=3)
+    @discord.ui.button(label="GM Map", style=discord.ButtonStyle.success, row=1)
     async def gm_map(self, i: discord.Interaction, b: discord.ui.Button):
         if not await self._check(i): return
         await i.response.defer(ephemeral=True, thinking=True)
@@ -619,22 +609,22 @@ class GmPanelView(discord.ui.View):
         except Exception as e:
             await i.followup.send(f"Error rendering GM map: {e}", ephemeral=True)
 
-    @discord.ui.button(label="Grant Banner", style=discord.ButtonStyle.primary, row=4)
+    @discord.ui.button(label="Grant Banner", style=discord.ButtonStyle.primary, row=3)
     async def grant_banner(self, i: discord.Interaction, b: discord.ui.Button):
         if not await self._check(i): return
         await i.response.send_modal(_GrantCosmeticModal("banner", remove=False))
 
-    @discord.ui.button(label="Remove Banner", style=discord.ButtonStyle.secondary, row=4)
+    @discord.ui.button(label="Remove Banner", style=discord.ButtonStyle.secondary, row=3)
     async def remove_banner(self, i: discord.Interaction, b: discord.ui.Button):
         if not await self._check(i): return
         await i.response.send_modal(_GrantCosmeticModal("banner", remove=True))
 
-    @discord.ui.button(label="Grant Badge", style=discord.ButtonStyle.primary, row=4)
+    @discord.ui.button(label="Grant Badge", style=discord.ButtonStyle.primary, row=3)
     async def grant_badge(self, i: discord.Interaction, b: discord.ui.Button):
         if not await self._check(i): return
         await i.response.send_modal(_GrantCosmeticModal("badge", remove=False))
 
-    @discord.ui.button(label="Remove Badge", style=discord.ButtonStyle.secondary, row=4)
+    @discord.ui.button(label="Remove Badge", style=discord.ButtonStyle.secondary, row=3)
     async def remove_badge(self, i: discord.Interaction, b: discord.ui.Button):
         if not await self._check(i): return
         await i.response.send_modal(_GrantCosmeticModal("badge", remove=True))
@@ -742,7 +732,7 @@ class AdminPanelPagerView(_PagedPanelView):
                     {"label": "Status", "method": "game_status"},
                     {"label": "Turn Interval", "method": "set_turn_interval"},
                     {"label": "Force Turn", "method": "force_turn", "style": discord.ButtonStyle.danger},
-                    {"label": "Reset War", "method": "game_reset", "style": discord.ButtonStyle.danger},
+                    {"label": "🗑️ Reset Menu", "method": "game_reset", "style": discord.ButtonStyle.danger},
                 ],
             },
             {
@@ -2075,6 +2065,352 @@ class _RemoveEnemyModal(discord.ui.Modal, title="Remove Enemy Unit"):
         else:
             await i.response.send_message(f"Enemy unit **{uid}** removed.", ephemeral=True)
             await _refresh_public_surfaces(i.client, i.guild_id)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Tiered Reset System
+# ════════════════════════════════════════════════════════════════════════════
+# Tier 1 — 🔄 Battlefield Reset  (active planet)
+#   Clears: enemy_units, combat_log, turn_history, enemy_gm_moves,
+#           movement_arrows, hex control. Keeps squadrons in roster.
+#
+# Tier 2 — 📋 Contract Reset
+#   Cancels all non-concluded contracts, clears sign-ups, returns fleets.
+#   Keeps players, planets, terrain, profiles.
+#
+# Tier 3 — 🌍 Planet Reset  (active planet)
+#   Everything on one planet: all of Tier 1 + squadrons + terrain + contracts
+#   linked to that planet.  Other planets untouched.
+#
+# Tier 4 — 👥 Roster Reset
+#   Wipes all squadrons (active + retired), unit_contract_map, player_economy.
+#   Keeps commander profiles, cosmetics, planets, contracts.
+#
+# Tier 5 — ☢️  Full Server Reset
+#   Wipes everything game-state related.  Preserves channel/role config,
+#   theme, planet definitions, and cosmetic definitions.
+# ════════════════════════════════════════════════════════════════════════════
+
+def _reset_menu_embed(planet_name: str) -> discord.Embed:
+    return discord.Embed(
+        title="🗑️  Reset Control Centre",
+        color=0xAA2222,
+        description=(
+            "Choose the scope of the reset. **All actions are irreversible.**\n\n"
+            f"Active planet: **{planet_name}**\n\n"
+            "**🔄 Battlefield** — clear unit positions, combat log, hex control on the active planet. "
+            "Rosters and contracts untouched.\n\n"
+            "**📋 Contracts** — cancel all open/locked contracts, return fleets. "
+            "Planets, terrain, and player profiles untouched.\n\n"
+            "**🌍 Planet** — full wipe of the active planet: "
+            "units, terrain, hexes, linked contracts. Other planets untouched.\n\n"
+            "**👥 Rosters** — delete all squadrons (active + retired), unit–contract links, "
+            "and player economy. Profiles and cosmetics kept.\n\n"
+            "**☢️  Full Reset** — wipe all game state for this server. "
+            "Preserves channel config, theme, planet definitions, and cosmetic definitions."
+        ),
+    ).set_footer(text="Each button opens a confirmation prompt.")
+
+
+class _ResetMenuView(discord.ui.View):
+    """Tiered reset sub-panel opened from the Admin Panel Reset Menu button."""
+
+    def __init__(self, bot, guild_id: int, admin_id: int, planet_name: str):
+        super().__init__(timeout=120)
+        self.bot         = bot
+        self.guild_id    = guild_id
+        self.admin_id    = admin_id
+        self.planet_name = planet_name
+
+    async def interaction_check(self, i: discord.Interaction) -> bool:
+        if i.user.id != self.admin_id:
+            await i.response.send_message("This panel is not yours.", ephemeral=True)
+            return False
+        return True
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    async def _confirm(self, i: discord.Interaction, description: str) -> bool:
+        """Show a confirm/cancel prompt. Returns True only if the admin confirms."""
+        view = _ConfirmView(self.admin_id)
+        await i.response.edit_message(
+            embed=discord.Embed(
+                title="⚠️  Confirm Reset",
+                description=description,
+                color=0xCC2222,
+            ),
+            view=view,
+        )
+        await view.wait()
+        return view.confirmed
+
+    async def _done(self, i: discord.Interaction, message: str):
+        await i.edit_original_response(
+            embed=discord.Embed(title="✅  Reset Complete",
+                                description=message, color=0x22AA44),
+            view=None)
+        await _refresh_public_surfaces(self.bot, self.guild_id)
+
+    async def _cancelled(self, i: discord.Interaction):
+        await i.edit_original_response(
+            embed=_reset_menu_embed(self.planet_name),
+            view=_ResetMenuView(self.bot, self.guild_id, self.admin_id, self.planet_name))
+
+    # ── Tier 1: Battlefield ───────────────────────────────────────────────────
+
+    @discord.ui.button(label="🔄 Battlefield", style=discord.ButtonStyle.secondary, row=0)
+    async def reset_battlefield(self, i: discord.Interaction, b: discord.ui.Button):
+        """Clear unit positions, combat log, and hex control on the active planet."""
+        confirmed = await self._confirm(i,
+            f"**Battlefield Reset — {self.planet_name}**\n\n"
+            "This will:\n"
+            "• Remove all **enemy units** from the map\n"
+            "• Clear **combat log**, turn history, and movement arrows\n"
+            "• Reset all **hex control** to neutral\n\n"
+            "Player squadrons remain in the roster. Contracts and terrain untouched.")
+        if not confirmed:
+            await self._cancelled(i); return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            planet_id = await get_active_planet_id(conn, self.guild_id)
+            for tbl in ("enemy_units", "combat_log", "turn_history",
+                        "enemy_gm_moves", "movement_arrows"):
+                await conn.execute(
+                    f"DELETE FROM {tbl} WHERE guild_id=$1 AND planet_id=$2",
+                    self.guild_id, planet_id)
+            await conn.execute(
+                "UPDATE hexes SET controller='neutral', status='neutral' "
+                "WHERE guild_id=$1 AND planet_id=$2",
+                self.guild_id, planet_id)
+            await conn.execute(
+                "UPDATE squadrons SET is_active=FALSE, in_transit=FALSE, "
+                "transit_destination=NULL, transit_turns_left=0, is_dug_in=FALSE, "
+                "artillery_armed=FALSE, hexes_moved_this_turn=0 "
+                "WHERE guild_id=$1 AND planet_id=$2",
+                self.guild_id, planet_id)
+            await conn.execute(
+                "UPDATE guild_config SET last_turn_at=NOW() WHERE guild_id=$1",
+                self.guild_id)
+        await self._done(i,
+            f"🔄 **{self.planet_name}** battlefield cleared.\n"
+            "Enemy units removed · Combat log wiped · Hexes reset to neutral.\n"
+            "Player rosters and contracts are untouched.")
+
+    # ── Tier 2: Contracts ─────────────────────────────────────────────────────
+
+    @discord.ui.button(label="📋 Contracts", style=discord.ButtonStyle.secondary, row=0)
+    async def reset_contracts(self, i: discord.Interaction, b: discord.ui.Button):
+        """Cancel all open/active contracts and return fleets to the pool."""
+        confirmed = await self._confirm(i,
+            "**Contract Reset — All Planets**\n\n"
+            "This will:\n"
+            "• Cancel every contract not already concluded\n"
+            "• Delete all **sign-ups** (contract_acceptances)\n"
+            "• Return all **fleets** to the available pool\n"
+            "• Clear unit–contract links (unit_contract_map)\n\n"
+            "Player squadrons, planets, terrain, and profiles are untouched.")
+        if not confirmed:
+            await self._cancelled(i); return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # Sum fleets to return before cancelling
+            fleets_back = await conn.fetchval(
+                "SELECT COALESCE(SUM(fleet_count),0) FROM contracts "
+                "WHERE guild_id=$1 AND status NOT IN "
+                "('concluded_success','concluded_failure','cancelled')",
+                self.guild_id) or 0
+            await conn.execute(
+                "UPDATE contracts SET status='cancelled', fleet_count=0, "
+                "deployment_capacity=0 "
+                "WHERE guild_id=$1 AND status NOT IN "
+                "('concluded_success','concluded_failure','cancelled')",
+                self.guild_id)
+            await conn.execute(
+                "DELETE FROM contract_acceptances WHERE guild_id=$1", self.guild_id)
+            await conn.execute(
+                "DELETE FROM unit_contract_map WHERE guild_id=$1", self.guild_id)
+            await conn.execute(
+                "UPDATE guild_config "
+                "SET fleet_pool_available=fleet_pool_available+$1 "
+                "WHERE guild_id=$2",
+                int(fleets_back), self.guild_id)
+        await self._done(i,
+            f"📋 All contracts cancelled.\n"
+            f"**{int(fleets_back)}** fleet(s) returned to pool.\n"
+            "Sign-ups and unit links cleared.")
+
+    # ── Tier 3: Planet ────────────────────────────────────────────────────────
+
+    @discord.ui.button(label="🌍 Planet", style=discord.ButtonStyle.danger, row=0)
+    async def reset_planet(self, i: discord.Interaction, b: discord.ui.Button):
+        """Full wipe of the active planet — units, terrain, hexes, linked contracts."""
+        confirmed = await self._confirm(i,
+            f"**Planet Reset — {self.planet_name}**\n\n"
+            "This will wipe the **entire active planet**:\n"
+            "• All squadrons (active + roster) on this planet\n"
+            "• All enemy units, combat log, turn history\n"
+            "• Hex control and **custom terrain** (reset to plains)\n"
+            "• All contracts linked to this planet + their sign-ups\n"
+            "• Movement arrows\n\n"
+            "Other planets are untouched. Commander profiles and cosmetics kept.")
+        if not confirmed:
+            await self._cancelled(i); return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            planet_id = await get_active_planet_id(conn, self.guild_id)
+            for tbl in ("squadrons", "enemy_units", "combat_log", "turn_history",
+                        "enemy_gm_moves", "movement_arrows", "hex_terrain",
+                        "turn_report_messages"):
+                await conn.execute(
+                    f"DELETE FROM {tbl} WHERE guild_id=$1 AND planet_id=$2",
+                    self.guild_id, planet_id)
+            await conn.execute(
+                "UPDATE hexes SET controller='neutral', status='neutral' "
+                "WHERE guild_id=$1 AND planet_id=$2",
+                self.guild_id, planet_id)
+            # Cancel contracts tied to this planet and return fleets
+            fleets_back = await conn.fetchval(
+                "SELECT COALESCE(SUM(fleet_count),0) FROM contracts "
+                "WHERE guild_id=$1 AND planet_id=$2 "
+                "AND status NOT IN ('concluded_success','concluded_failure','cancelled')",
+                self.guild_id, planet_id) or 0
+            await conn.execute(
+                "UPDATE contracts SET status='cancelled', fleet_count=0, "
+                "deployment_capacity=0 "
+                "WHERE guild_id=$1 AND planet_id=$2 "
+                "AND status NOT IN ('concluded_success','concluded_failure','cancelled')",
+                self.guild_id, planet_id)
+            await conn.execute(
+                "DELETE FROM contract_acceptances WHERE guild_id=$1 AND contract_id IN "
+                "(SELECT id FROM contracts WHERE guild_id=$1 AND planet_id=$2)",
+                self.guild_id, planet_id)
+            await conn.execute(
+                "DELETE FROM unit_contract_map WHERE guild_id=$1 AND contract_id IN "
+                "(SELECT id FROM contracts WHERE guild_id=$1 AND planet_id=$2)",
+                self.guild_id, planet_id)
+            if fleets_back > 0:
+                await conn.execute(
+                    "UPDATE guild_config "
+                    "SET fleet_pool_available=fleet_pool_available+$1 "
+                    "WHERE guild_id=$2",
+                    int(fleets_back), self.guild_id)
+            # Clear stored map message for this planet
+            await conn.execute(
+                "DELETE FROM planet_map_messages WHERE guild_id=$1 AND planet_id=$2",
+                self.guild_id, planet_id)
+            await conn.execute(
+                "UPDATE guild_config SET last_turn_at=NOW() WHERE guild_id=$1",
+                self.guild_id)
+        await self._done(i,
+            f"🌍 **{self.planet_name}** fully reset.\n"
+            f"Units, terrain, contracts, and history wiped.\n"
+            + (f"**{int(fleets_back)}** fleet(s) returned to pool." if fleets_back else ""))
+
+    # ── Tier 4: Rosters ───────────────────────────────────────────────────────
+
+    @discord.ui.button(label="👥 Rosters", style=discord.ButtonStyle.danger, row=1)
+    async def reset_rosters(self, i: discord.Interaction, b: discord.ui.Button):
+        """Delete all squadrons server-wide and clear player economy."""
+        confirmed = await self._confirm(i,
+            "**Roster Reset — All Planets**\n\n"
+            "This will:\n"
+            "• Delete **all squadrons** (active and retired) across every planet\n"
+            "• Clear all **unit–contract links**\n"
+            "• Reset **player economy** (credits, scores)\n\n"
+            "Commander profiles, cosmetics, planets, contracts, and terrain are kept.\n"
+            "This is a **season reset** — use it to start a new campaign with fresh units.")
+        if not confirmed:
+            await self._cancelled(i); return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            sq_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM squadrons WHERE guild_id=$1", self.guild_id) or 0
+            await conn.execute(
+                "DELETE FROM squadrons WHERE guild_id=$1", self.guild_id)
+            await conn.execute(
+                "DELETE FROM unit_contract_map WHERE guild_id=$1", self.guild_id)
+            await conn.execute(
+                "DELETE FROM player_economy WHERE guild_id=$1", self.guild_id)
+            # Reset commander recovery status but keep profiles/cosmetics
+            await conn.execute(
+                "UPDATE commander_profiles SET recovery_status=NULL "
+                "WHERE guild_id=$1",
+                self.guild_id)
+        await self._done(i,
+            f"👥 Rosters cleared.\n"
+            f"**{int(sq_count)}** squadron(s) deleted · Economy reset.\n"
+            "Commander profiles and cosmetics are untouched.")
+
+    # ── Tier 5: Full Server Reset ─────────────────────────────────────────────
+
+    @discord.ui.button(label="☢️  Full Reset", style=discord.ButtonStyle.danger, row=1)
+    async def reset_full(self, i: discord.Interaction, b: discord.ui.Button):
+        """Nuclear option — wipes all game state for this server."""
+        # Double-confirmation: first the menu confirm, then a typed acknowledgement
+        confirmed = await self._confirm(i,
+            "**⚠️  FULL SERVER RESET ⚠️**\n\n"
+            "This will delete **all game state** for this server:\n"
+            "• All squadrons, enemy units, combat logs, turn history\n"
+            "• All hex control and custom terrain on every planet\n"
+            "• All contracts, sign-ups, and unit links\n"
+            "• Player economy and commander recovery status\n"
+            "• All per-planet map message references\n\n"
+            "**Preserved:** channel config, roles, theme, planet definitions, "
+            "cosmetic definitions, and commander profiles.\n\n"
+            "**This cannot be undone.** Are you absolutely sure?")
+        if not confirmed:
+            await self._cancelled(i); return
+
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # ── Wipe all per-planet game data ──────────────────────────────
+            for tbl in ("squadrons", "enemy_units", "combat_log", "turn_history",
+                        "enemy_gm_moves", "movement_arrows", "hex_terrain",
+                        "turn_report_messages"):
+                await conn.execute(f"DELETE FROM {tbl} WHERE guild_id=$1", self.guild_id)
+
+            # Reset all hexes to neutral on every planet
+            await conn.execute(
+                "UPDATE hexes SET controller='neutral', status='neutral' "
+                "WHERE guild_id=$1", self.guild_id)
+
+            # ── Wipe contracts + related ────────────────────────────────────
+            await conn.execute(
+                "DELETE FROM contract_acceptances WHERE guild_id=$1", self.guild_id)
+            await conn.execute(
+                "DELETE FROM unit_contract_map WHERE guild_id=$1", self.guild_id)
+            await conn.execute(
+                "UPDATE contracts SET status='cancelled', fleet_count=0, "
+                "deployment_capacity=0 "
+                "WHERE guild_id=$1 AND status NOT IN "
+                "('concluded_success','concluded_failure')",
+                self.guild_id)
+
+            # ── Reset economy + commander state ─────────────────────────────
+            await conn.execute(
+                "DELETE FROM player_economy WHERE guild_id=$1", self.guild_id)
+            await conn.execute(
+                "UPDATE commander_profiles SET recovery_status=NULL "
+                "WHERE guild_id=$1", self.guild_id)
+
+            # ── Reset fleet pool and turn clock ─────────────────────────────
+            await conn.execute(
+                "UPDATE guild_config "
+                "SET fleet_pool_available=1, operational_tempo=0, "
+                "    last_turn_at=NOW(), game_started=FALSE "
+                "WHERE guild_id=$1", self.guild_id)
+
+            # ── Clear map message references ────────────────────────────────
+            await conn.execute(
+                "DELETE FROM planet_map_messages WHERE guild_id=$1", self.guild_id)
+            await conn.execute(
+                "UPDATE guild_config SET map_message_id=NULL, overview_message_id=NULL "
+                "WHERE guild_id=$1", self.guild_id)
+
+        await self._done(i,
+            "☢️  **Full server reset complete.**\n"
+            "All game state wiped. Channel config, theme, planets, and cosmetics preserved.\n"
+            "The server is ready for a fresh campaign.")
 
 
 # ──── Confirm view ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
