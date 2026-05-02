@@ -983,14 +983,13 @@ def _draw_overview_node(draw, x, y, planet, is_active, fonts):
     r = 16 if is_active else (13 if has_contract else 10)
 
     if is_active:
-        # Active admin planet: bright grey with concentric rings
-        for grow, lum in [(22, 34), (16, 52), (10, 76)]:
-            draw.ellipse((x - r - grow, y - r - grow, x + r + grow, y + r + grow),
-                         outline=(lum, lum, lum), width=1)
+        # Main Base planet: normal-looking planet (dark fill, blue-grey outline)
+        # The moon carries the special ring treatment instead of the planet
         draw.ellipse((x - r, y - r, x + r, y + r),
-                     fill=(198, 198, 198), outline=(245, 245, 245), width=2)
-        draw.ellipse((x - r - 7, y - r - 7, x + r + 7, y + r + 7),
-                     outline=(218, 218, 218), width=2)
+                     fill=(28, 34, 44), outline=(140, 160, 190), width=2)
+        # Single subtle ring to mark as home base
+        draw.ellipse((x - r - 5, y - r - 5, x + r + 5, y + r + 5),
+                     outline=(80, 100, 130), width=1)
     elif has_contract:
         # Has an active contract but is not the admin-selected active planet
         # Show with a warm amber/gold pulse ring to indicate "war ongoing here"
@@ -1074,18 +1073,34 @@ def _draw_overview_orbit_map(draw, planets, active_planet_id, box, fonts, moons_
         planet_id = _overview_value(planet, "id")
         moons = moons_by_planet.get(planet_id, [])
         planet_r = 16 if is_active else (13 if has_contract else 10)
-        moon_orbit = planet_r + 18
+        # Push orbit radius well clear of the planet's text labels (which extend ~150px right)
+        # Place moons below/above the planet to avoid the rightward label zone
+        moon_orbit = planet_r + 32
         for m_idx, moon_name in enumerate(moons[:4]):  # max 4 moons rendered
-            m_angle = angle + math.pi / 2 + (2 * math.pi * m_idx / max(len(moons), 1))
+            # Angle moons downward from the planet (below in screen space) so they
+            # don't collide with the name/status labels that extend to the right
+            base_angle = angle + math.pi * 0.6  # start below-right
+            m_angle = base_angle + (math.pi * 0.5 * m_idx / max(len(moons), 1))
             mx = int(px + math.cos(m_angle) * moon_orbit)
             my = int(py + math.sin(m_angle) * moon_orbit)
             mr = 4
-            # Moon orbit ring (faint dashed look using a thin ellipse)
+            # Faint orbit ring around the planet
             draw.ellipse((px - moon_orbit, py - moon_orbit, px + moon_orbit, py + moon_orbit),
-                         outline=(38, 38, 42), width=1)
-            draw.ellipse((mx - mr, my - mr, mx + mr, my + mr),
-                         fill=(72, 72, 76), outline=(140, 140, 148), width=1)
-            _overview_text(draw, (mx + mr + 3, my - 6), moon_name, fonts["mono"], (108, 108, 116), max_width=80)
+                         outline=(38, 38, 48), width=1)
+            if is_active:
+                # Main Base moon: bright concentric glow rings — the visual "special" marker
+                for grow, lum in [(10, 38), (7, 62), (4, 100)]:
+                    draw.ellipse((mx - mr - grow, my - mr - grow,
+                                  mx + mr + grow, my + mr + grow),
+                                 outline=(lum, lum + 10, lum + 30), width=1)
+                draw.ellipse((mx - mr, my - mr, mx + mr, my + mr),
+                             fill=(200, 210, 230), outline=(240, 245, 255), width=2)
+            else:
+                draw.ellipse((mx - mr, my - mr, mx + mr, my + mr),
+                             fill=(72, 72, 76), outline=(140, 140, 148), width=1)
+            # Label below the moon so it doesn't overlap the planet text
+            _overview_text(draw, (mx - 20, my + mr + 4), moon_name, fonts["mono"],
+                           (200, 210, 230) if is_active else (108, 108, 116), max_width=80)
 
 
 def _draw_overview_bottom_cards(draw, planets, active_planet_id, box, fonts):
