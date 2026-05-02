@@ -424,3 +424,17 @@ DO $$ BEGIN ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS auto_spawn_count  
 DO $$ BEGIN ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS auto_spawn_type    TEXT    NOT NULL DEFAULT 'Enemy'; END $$;
 DO $$ BEGIN ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS auto_spawn_hp      INT     NOT NULL DEFAULT 100;   END $$;
 DO $$ BEGIN ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS auto_ai_enabled    BOOLEAN NOT NULL DEFAULT FALSE; END $$;
+
+-- v10: Per-planet Auto-Spawn & Auto-AI settings ──────────────────────────────
+-- Replaces the global guild_config columns with per-planet rows so each
+-- planet can have independent automation settings.
+CREATE TABLE IF NOT EXISTS planet_auto_settings (
+    guild_id            BIGINT  NOT NULL,
+    planet_id           INT     NOT NULL,
+    auto_spawn_enabled  BOOLEAN NOT NULL DEFAULT FALSE,
+    auto_spawn_count    INT     NOT NULL DEFAULT 1,
+    auto_spawn_type     TEXT    NOT NULL DEFAULT 'Enemy',
+    auto_spawn_hp       INT     NOT NULL DEFAULT 100,
+    auto_ai_enabled     BOOLEAN NOT NULL DEFAULT FALSE,
+    PRIMARY KEY (guild_id, planet_id)
+);

@@ -523,8 +523,8 @@ class TurnEngine:
         cfg = await conn.fetchrow(
             "SELECT auto_spawn_enabled, auto_spawn_count, auto_spawn_type, "
             "auto_spawn_hp, auto_ai_enabled "
-            "FROM guild_config WHERE guild_id=$1",
-            guild_id)
+            "FROM planet_auto_settings WHERE guild_id=$1 AND planet_id=$2",
+            guild_id, planet_id)
         auto_spawn  = cfg["auto_spawn_enabled"] if cfg else False
         auto_ai     = cfg["auto_ai_enabled"]    if cfg else False
 

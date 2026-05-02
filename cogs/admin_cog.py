@@ -312,6 +312,14 @@ class AdminPanelView(discord.ui.View):
         await i.response.send_message(
             "Choose terrain type:", view=_TerrainTypeView(i.guild_id), ephemeral=True)
 
+    @discord.ui.button(label="⛰️ Bulk Set Terrain", style=discord.ButtonStyle.primary, row=2)
+    async def map_bulk_terrain(self, i: discord.Interaction, b: discord.ui.Button):
+        """Bulk-set many hexes to one terrain type in a single operation."""
+        if not await _is_admin(self.bot, i):
+            await i.response.send_message("Admins only.", ephemeral=True); return
+        await i.response.send_message(
+            "Choose terrain type for bulk assignment:", view=_BulkTerrainTypeView(i.guild_id), ephemeral=True)
+
     @discord.ui.button(label="🗺️ Random Terrain", style=discord.ButtonStyle.secondary, row=2)
     async def map_random_terrain(self, i: discord.Interaction, b: discord.ui.Button):
         if not await _is_admin(self.bot, i):
@@ -724,30 +732,35 @@ class GmPanelView(discord.ui.View):
 
     @discord.ui.button(label="🤖 Auto-Spawn AI", style=discord.ButtonStyle.danger, row=3)
     async def auto_spawn_toggle(self, i: discord.Interaction, b: discord.ui.Button):
-        """Configure and toggle automatic enemy spawning at the map edge each turn."""
+        """Pick a planet, then configure automatic enemy spawning for that planet."""
         if not await self._check(i): return
         pool = await get_pool()
         async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT auto_spawn_enabled, auto_spawn_count, auto_spawn_type, auto_spawn_hp "
-                "FROM guild_config WHERE guild_id=$1", i.guild_id)
-        current_enabled = row["auto_spawn_enabled"] if row else False
-        current_count   = row["auto_spawn_count"]   if row else 1
-        current_type    = row["auto_spawn_type"]    if row else "Enemy"
-        current_hp      = row["auto_spawn_hp"]      if row else 100
-        await i.response.send_modal(
-            _AutoSpawnConfigModal(current_enabled, current_count, current_type, current_hp))
+            planets = await conn.fetch(
+                "SELECT id, name FROM planets WHERE guild_id=$1 ORDER BY sort_order, id",
+                i.guild_id)
+        if not planets:
+            await i.response.send_message("No planets configured.", ephemeral=True); return
+        await i.response.send_message(
+            "Choose a planet to configure Auto-Spawn AI for:",
+            view=_AutoPlanetPickView(list(planets), mode="spawn"),
+            ephemeral=True)
 
     @discord.ui.button(label="🧠 Auto-AI Combat", style=discord.ButtonStyle.danger, row=3)
     async def auto_ai_toggle(self, i: discord.Interaction, b: discord.ui.Button):
-        """Toggle automatic AI movement and combat against player units each turn."""
+        """Pick a planet, then toggle automatic AI movement/combat for that planet."""
         if not await self._check(i): return
         pool = await get_pool()
         async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT auto_ai_enabled FROM guild_config WHERE guild_id=$1", i.guild_id)
-        current = row["auto_ai_enabled"] if row else False
-        await i.response.send_modal(_AutoAIConfigModal(current))
+            planets = await conn.fetch(
+                "SELECT id, name FROM planets WHERE guild_id=$1 ORDER BY sort_order, id",
+                i.guild_id)
+        if not planets:
+            await i.response.send_message("No planets configured.", ephemeral=True); return
+        await i.response.send_message(
+            "Choose a planet to configure Auto-AI Combat for:",
+            view=_AutoPlanetPickView(list(planets), mode="ai"),
+            ephemeral=True)
 
 
 class _AdminCosmeticView(discord.ui.View):
@@ -879,6 +892,7 @@ class AdminPanelPagerView(_PagedPanelView):
                     {"label": "Set Theme", "method": "theme_set"},
                     {"label": "Set Color", "method": "theme_color"},
                     {"label": "Set Terrain", "method": "map_set_terrain"},
+                    {"label": "⛰️ Bulk Set Terrain", "method": "map_bulk_terrain", "style": discord.ButtonStyle.primary},
                     {"label": "Random Terrain", "method": "map_random_terrain"},
                     {"label": "Reset Terrain", "method": "map_reset_terrain", "style": discord.ButtonStyle.danger},
                     {"label": "Cosmetics", "method": "cosmetics", "style": discord.ButtonStyle.primary},
@@ -1415,6 +1429,115 @@ class _TerrainHexModal(discord.ui.Modal, title="Set Terrain"):
             """, i.guild_id, planet_id, addr, self.terrain)
         await i.response.send_message(
             f"`{addr}` set to **{self.terrain.title()}**.", ephemeral=True)
+        await _refresh_public_surfaces(i.client, i.guild_id)
+
+
+# Terrain — bulk variant: pick type → paste hex list + optional planet ID
+class _BulkTerrainTypeView(discord.ui.View):
+    """Dropdown to pick a terrain type, then opens _BulkTerrainHexModal."""
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=60)
+        self.guild_id = guild_id
+        select = discord.ui.Select(
+            placeholder="Choose terrain type for bulk assignment...",
+            options=[
+                discord.SelectOption(label=t.title(), value=t)
+                for t in TERRAIN_TYPES
+            ])
+        select.callback = self._on_select
+        self.add_item(select)
+
+    async def _on_select(self, i: discord.Interaction):
+        terrain = i.data["values"][0]
+        await i.response.send_modal(_BulkTerrainHexModal(terrain))
+
+
+class _BulkTerrainHexModal(discord.ui.Modal, title="Bulk Set Terrain"):
+    """Paste a list of hex addresses (one per line) and an optional planet ID."""
+
+    hexes_input = discord.ui.TextInput(
+        label="Hex addresses — one per line",
+        placeholder="3,-2\n0,5\n-4,1\n7,-3",
+        style=discord.TextStyle.paragraph,
+        max_length=2000,
+        required=True,
+    )
+    planet_input = discord.ui.TextInput(
+        label="Planet ID (blank = active planet)",
+        placeholder="e.g. 2",
+        max_length=6,
+        required=False,
+    )
+
+    def __init__(self, terrain: str):
+        super().__init__(title=f"Bulk Set Terrain — {terrain.title()}")
+        self.terrain = terrain
+
+    async def on_submit(self, i: discord.Interaction):
+        raw_lines = str(self.hexes_input).strip().splitlines()
+
+        # Parse and validate every address
+        valid   = []
+        invalid = []
+        for line in raw_lines:
+            addr = line.strip()
+            if not addr:
+                continue
+            if is_valid(addr):
+                valid.append(addr)
+            else:
+                invalid.append(addr)
+
+        if not valid:
+            msg = "No valid hex addresses found."
+            if invalid:
+                msg += "\n\nInvalid entries:\n" + "\n".join(f"• `{x}`" for x in invalid[:15])
+            await i.response.send_message(msg[:2000], ephemeral=True)
+            return
+
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # Resolve planet
+            pid_raw = str(self.planet_input).strip()
+            if pid_raw.isdigit():
+                planet_id = int(pid_raw)
+                planet = await conn.fetchrow(
+                    "SELECT id, name FROM planets WHERE guild_id=$1 AND id=$2",
+                    i.guild_id, planet_id)
+                if not planet:
+                    await i.response.send_message(
+                        f"Planet ID {planet_id} not found.", ephemeral=True)
+                    return
+            else:
+                planet_id = await get_active_planet_id(conn, i.guild_id)
+                planet = await conn.fetchrow(
+                    "SELECT id, name FROM planets WHERE guild_id=$1 AND id=$2",
+                    i.guild_id, planet_id)
+            planet_name = planet["name"] if planet else f"#{planet_id}"
+
+            # Upsert all valid addresses in one go
+            for addr in valid:
+                await conn.execute("""
+                    INSERT INTO hex_terrain (guild_id, planet_id, address, terrain)
+                    VALUES ($1,$2,$3,$4)
+                    ON CONFLICT (guild_id, planet_id, address)
+                    DO UPDATE SET terrain=EXCLUDED.terrain
+                """, i.guild_id, planet_id, addr, self.terrain)
+
+        # Build confirmation message
+        preview = ", ".join(f"`{a}`" for a in valid[:10])
+        if len(valid) > 10:
+            preview += f" … +{len(valid) - 10} more"
+        msg = (
+            f"⛰️ **{self.terrain.title()}** applied to **{len(valid)}** hex(es) "
+            f"on **{planet_name}**.\n{preview}"
+        )
+        if invalid:
+            skipped = ", ".join(f"`{x}`" for x in invalid[:8])
+            if len(invalid) > 8:
+                skipped += f" … +{len(invalid) - 8} more"
+            msg += f"\n\n⚠️ **{len(invalid)} skipped** (invalid addresses): {skipped}"
+        await i.response.send_message(msg[:2000], ephemeral=True)
         await _refresh_public_surfaces(i.client, i.guild_id)
 
 
@@ -2335,12 +2458,51 @@ class _BulkSpawnEnemyModal(discord.ui.Modal, title="Bulk Spawn Enemy Units"):
         await _refresh_public_surfaces(i.client, i.guild_id)
 
 
-class _AutoSpawnConfigModal(discord.ui.Modal, title="Configure Auto-Spawn AI"):
-    """Modal for enabling/configuring automatic AI spawning each turn."""
+# ── Per-planet automation: planet picker → modal ──────────────────────────────
 
-    def __init__(self, current_enabled: bool, current_count: int, current_type: str, current_hp: int):
-        super().__init__()
-        self._current_enabled = current_enabled
+class _AutoPlanetPickView(discord.ui.View):
+    """Dropdown listing all planets; on selection opens the right config modal."""
+
+    def __init__(self, planets: list, mode: str):
+        super().__init__(timeout=60)
+        self._mode = mode  # "spawn" or "ai"
+        options = [
+            discord.SelectOption(label=p["name"], value=str(p["id"]))
+            for p in planets[:25]
+        ]
+        select = discord.ui.Select(placeholder="Select a planet…", options=options)
+        select.callback = self._on_select
+        self.add_item(select)
+
+    async def _on_select(self, i: discord.Interaction):
+        planet_id   = int(i.data["values"][0])
+        planet_name = next(
+            (o.label for o in self.children[0].options if o.value == str(planet_id)),
+            f"#{planet_id}")
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM planet_auto_settings WHERE guild_id=$1 AND planet_id=$2",
+                i.guild_id, planet_id)
+        if self._mode == "spawn":
+            await i.response.send_modal(_AutoSpawnConfigModal(
+                planet_id=planet_id,
+                planet_name=planet_name,
+                current_enabled=row["auto_spawn_enabled"] if row else False,
+                current_count=  row["auto_spawn_count"]   if row else 1,
+                current_type=   row["auto_spawn_type"]    if row else "Enemy",
+                current_hp=     row["auto_spawn_hp"]      if row else 100,
+            ))
+        else:
+            await i.response.send_modal(_AutoAIConfigModal(
+                planet_id=planet_id,
+                planet_name=planet_name,
+                current_enabled=row["auto_ai_enabled"] if row else False,
+            ))
+
+
+class _AutoSpawnConfigModal(discord.ui.Modal, title="Configure Auto-Spawn AI"):
+    """Per-planet: enable/configure automatic AI spawning each turn."""
 
     enabled_input = discord.ui.TextInput(
         label="Enable Auto-Spawn? (yes / no)",
@@ -2366,6 +2528,13 @@ class _AutoSpawnConfigModal(discord.ui.Modal, title="Configure Auto-Spawn AI"):
         required=False,
     )
 
+    def __init__(self, planet_id: int, planet_name: str,
+                 current_enabled: bool, current_count: int,
+                 current_type: str, current_hp: int):
+        super().__init__(title=f"Auto-Spawn AI — {planet_name[:40]}")
+        self._planet_id   = planet_id
+        self._planet_name = planet_name
+
     async def on_submit(self, i: discord.Interaction):
         raw_enabled = str(self.enabled_input).strip().lower()
         if raw_enabled not in ("yes", "no", "y", "n", "true", "false", "1", "0", "on", "off"):
@@ -2389,33 +2558,39 @@ class _AutoSpawnConfigModal(discord.ui.Modal, title="Configure Auto-Spawn AI"):
 
         pool = await get_pool()
         async with pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE guild_config SET "
-                "auto_spawn_enabled=$1, auto_spawn_count=$2, "
-                "auto_spawn_type=$3, auto_spawn_hp=$4 "
-                "WHERE guild_id=$5",
-                enabled, count, unit_type, hp, i.guild_id)
+            await conn.execute("""
+                INSERT INTO planet_auto_settings
+                    (guild_id, planet_id, auto_spawn_enabled, auto_spawn_count,
+                     auto_spawn_type, auto_spawn_hp)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (guild_id, planet_id) DO UPDATE SET
+                    auto_spawn_enabled = EXCLUDED.auto_spawn_enabled,
+                    auto_spawn_count   = EXCLUDED.auto_spawn_count,
+                    auto_spawn_type    = EXCLUDED.auto_spawn_type,
+                    auto_spawn_hp      = EXCLUDED.auto_spawn_hp
+            """, i.guild_id, self._planet_id, enabled, count, unit_type, hp)
 
         status = "✅ **ENABLED**" if enabled else "⛔ **DISABLED**"
         await i.response.send_message(
-            f"🤖 Auto-Spawn AI {status}\n"
+            f"🤖 Auto-Spawn AI {status} on **{self._planet_name}**\n"
             f"• **{count}** `{unit_type}` unit(s) per turn — **{hp} HP** each\n"
             f"• Spawn location: outer edge of the map (random ring hexes)",
             ephemeral=True)
 
 
 class _AutoAIConfigModal(discord.ui.Modal, title="Configure Auto-AI Combat"):
-    """Modal for toggling automatic AI movement and combat."""
-
-    def __init__(self, current_enabled: bool):
-        super().__init__()
-        self._current_enabled = current_enabled
+    """Per-planet: toggle automatic AI movement and combat."""
 
     enabled_input = discord.ui.TextInput(
         label="Enable Auto-AI Combat? (yes / no)",
         placeholder="yes  or  no",
         max_length=3,
     )
+
+    def __init__(self, planet_id: int, planet_name: str, current_enabled: bool):
+        super().__init__(title=f"Auto-AI Combat — {planet_name[:40]}")
+        self._planet_id   = planet_id
+        self._planet_name = planet_name
 
     async def on_submit(self, i: discord.Interaction):
         raw = str(self.enabled_input).strip().lower()
@@ -2428,14 +2603,19 @@ class _AutoAIConfigModal(discord.ui.Modal, title="Configure Auto-AI Combat"):
 
         pool = await get_pool()
         async with pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE guild_config SET auto_ai_enabled=$1 WHERE guild_id=$2",
-                enabled, i.guild_id)
+            await conn.execute("""
+                INSERT INTO planet_auto_settings (guild_id, planet_id, auto_ai_enabled)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (guild_id, planet_id) DO UPDATE SET
+                    auto_ai_enabled = EXCLUDED.auto_ai_enabled
+            """, i.guild_id, self._planet_id, enabled)
 
         status = "✅ **ENABLED**" if enabled else "⛔ **DISABLED**"
+        action = ("automatically move toward and attack player units each turn"
+                  if enabled else "remain stationary unless GM-moved")
         await i.response.send_message(
-            f"🧠 Auto-AI Combat {status}\n"
-            f"• AI enemies will {'automatically move toward and attack player units each turn' if enabled else 'remain stationary unless GM-moved'}.",
+            f"🧠 Auto-AI Combat {status} on **{self._planet_name}**\n"
+            f"• AI enemies will {action}.",
             ephemeral=True)
 
 
