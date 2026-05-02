@@ -642,22 +642,36 @@ class GmPanelView(discord.ui.View):
         except Exception as e:
             await i.followup.send(f"Error rendering GM map: {e}", ephemeral=True)
 
-    @discord.ui.button(label="Grant Banner", style=discord.ButtonStyle.primary, row=3)
+    # ──── Row 2: Fleet Management ──────────────────────────────────────────────
+
+    @discord.ui.button(label="➕ Add Fleets", style=discord.ButtonStyle.success, row=2)
+    async def add_fleets(self, i: discord.Interaction, b: discord.ui.Button):
+        """Add fleets to the global pool."""
+        if not await self._check(i): return
+        await i.response.send_modal(_AdjustFleetModal(mode="add"))
+
+    @discord.ui.button(label="➖ Remove Fleets", style=discord.ButtonStyle.danger, row=2)
+    async def remove_fleets(self, i: discord.Interaction, b: discord.ui.Button):
+        """Remove fleets from the global pool."""
+        if not await self._check(i): return
+        await i.response.send_modal(_AdjustFleetModal(mode="remove"))
+
+    @discord.ui.button(label="Grant Banner", style=discord.ButtonStyle.primary, row=4)
     async def grant_banner(self, i: discord.Interaction, b: discord.ui.Button):
         if not await self._check(i): return
         await i.response.send_modal(_GrantCosmeticModal("banner", remove=False))
 
-    @discord.ui.button(label="Remove Banner", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.button(label="Remove Banner", style=discord.ButtonStyle.secondary, row=4)
     async def remove_banner(self, i: discord.Interaction, b: discord.ui.Button):
         if not await self._check(i): return
         await i.response.send_modal(_GrantCosmeticModal("banner", remove=True))
 
-    @discord.ui.button(label="Grant Badge", style=discord.ButtonStyle.primary, row=3)
+    @discord.ui.button(label="Grant Badge", style=discord.ButtonStyle.primary, row=4)
     async def grant_badge(self, i: discord.Interaction, b: discord.ui.Button):
         if not await self._check(i): return
         await i.response.send_modal(_GrantCosmeticModal("badge", remove=False))
 
-    @discord.ui.button(label="Remove Badge", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.button(label="Remove Badge", style=discord.ButtonStyle.secondary, row=4)
     async def remove_badge(self, i: discord.Interaction, b: discord.ui.Button):
         if not await self._check(i): return
         await i.response.send_modal(_GrantCosmeticModal("badge", remove=True))
@@ -1963,11 +1977,72 @@ class _CancelContractModal(discord.ui.Modal, title="Cancel Contract"):
 # or Conclude Contract to end an active one.
 # _StartContractModal aliased to _CreateContractModal for backwards compatibility.
 
+class _AdjustFleetModal(discord.ui.Modal):
+    """Add or remove fleets from the guild pool."""
+
+    amount_input = discord.ui.TextInput(
+        label="Number of fleets",
+        placeholder="e.g. 2",
+        max_length=4,
+        required=True,
+    )
+    reason_input = discord.ui.TextInput(
+        label="Reason (optional)",
+        placeholder="e.g. Contract concluded, Contract payment",
+        max_length=80,
+        required=False,
+    )
+
+    def __init__(self, mode: str = "add"):
+        self.mode = mode
+        verb = "Add" if mode == "add" else "Remove"
+        super().__init__(title=f"{verb} Fleets")
+
+    async def on_submit(self, i: discord.Interaction):
+        raw = str(self.amount_input).strip()
+        try:
+            amount = int(raw)
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            await i.response.send_message("Amount must be a positive integer.", ephemeral=True)
+            return
+
+        reason = str(self.reason_input).strip() or None
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            if self.mode == "add":
+                new_val = await conn.fetchval(
+                    "UPDATE guild_config SET fleet_pool_available=fleet_pool_available+$1 "
+                    "WHERE guild_id=$2 RETURNING fleet_pool_available",
+                    amount, i.guild_id)
+                msg = f"✅ Added **{amount}** fleet(s) to pool. Total now: **{new_val}**."
+            else:
+                current = await conn.fetchval(
+                    "SELECT fleet_pool_available FROM guild_config WHERE guild_id=$1", i.guild_id) or 0
+                if amount > current:
+                    await i.response.send_message(
+                        f"Cannot remove **{amount}** — only **{current}** fleet(s) in pool.", ephemeral=True)
+                    return
+                new_val = await conn.fetchval(
+                    "UPDATE guild_config SET fleet_pool_available=fleet_pool_available-$1 "
+                    "WHERE guild_id=$2 RETURNING fleet_pool_available",
+                    amount, i.guild_id)
+                msg = f"✅ Removed **{amount}** fleet(s) from pool. Remaining: **{new_val}**."
+
+        if reason:
+            msg += f"\nReason: *{reason}*"
+        await i.response.send_message(msg, ephemeral=True)
+        await _refresh_public_surfaces(i.client, i.guild_id)
+
+
 class _SpawnEnemyModal(discord.ui.Modal, title="Spawn Enemy Unit"):
     unit_type   = discord.ui.TextInput(label="Unit Type", placeholder="e.g. Scout", max_length=40)
     hex_address = discord.ui.TextInput(label="Hex Address", placeholder="e.g. 6,-3", max_length=12)
     hp_input    = discord.ui.TextInput(
         label="HP (default 100)", placeholder="e.g. 100", max_length=5, required=False)
+    planet_input = discord.ui.TextInput(
+        label="Planet ID (blank = active planet)", placeholder="e.g. 2", max_length=6, required=False)
 
     async def on_submit(self, i: discord.Interaction):
         addr = str(self.hex_address).strip()
@@ -1980,7 +2055,21 @@ class _SpawnEnemyModal(discord.ui.Modal, title="Spawn Enemy Unit"):
         v = lambda: random.randint(-2, 2)
         pool = await get_pool()
         async with pool.acquire() as conn:
-            planet_id = await get_active_planet_id(conn, i.guild_id)
+            # Planet resolution: explicit ID > active planet
+            pid_raw = str(self.planet_input).strip()
+            if pid_raw.isdigit():
+                planet_id = int(pid_raw)
+                planet = await conn.fetchrow(
+                    "SELECT id, name FROM planets WHERE guild_id=$1 AND id=$2",
+                    i.guild_id, planet_id)
+                if not planet:
+                    await i.response.send_message(f"Planet ID {planet_id} not found.", ephemeral=True); return
+            else:
+                planet_id = await get_active_planet_id(conn, i.guild_id)
+                planet = await conn.fetchrow(
+                    "SELECT id, name FROM planets WHERE guild_id=$1 AND id=$2",
+                    i.guild_id, planet_id)
+            planet_name = planet["name"] if planet else f"#{planet_id}"
             await conn.execute(
                 "INSERT INTO enemy_units "
                 "(guild_id, planet_id, unit_type, hex_address, "
@@ -1994,7 +2083,7 @@ class _SpawnEnemyModal(discord.ui.Modal, title="Spawn Enemy Unit"):
             except Exception:
                 pass
         await i.response.send_message(
-            f"👾 **{str(self.unit_type).strip()}** spawned at `{addr}` with **{hp} HP**.", ephemeral=True)
+            f"👾 **{str(self.unit_type).strip()}** spawned at `{addr}` with **{hp} HP** on **{planet_name}**.", ephemeral=True)
         await _refresh_public_surfaces(i.client, i.guild_id)
 
 
@@ -2008,6 +2097,8 @@ class _BulkSpawnEnemyModal(discord.ui.Modal, title="Bulk Spawn Enemy Units"):
     )
     hp_input = discord.ui.TextInput(
         label="HP per unit (default 100)", placeholder="e.g. 100", max_length=5, required=False)
+    planet_input = discord.ui.TextInput(
+        label="Planet ID (blank = active planet)", placeholder="e.g. 2", max_length=6, required=False)
 
     async def on_submit(self, i: discord.Interaction):
         try:
@@ -2050,7 +2141,20 @@ class _BulkSpawnEnemyModal(discord.ui.Modal, title="Bulk Spawn Enemy Units"):
         pool = await get_pool()
         successes = []
         async with pool.acquire() as conn:
-            planet_id = await get_active_planet_id(conn, i.guild_id)
+            pid_raw = str(self.planet_input).strip()
+            if pid_raw.isdigit():
+                planet_id = int(pid_raw)
+                planet = await conn.fetchrow(
+                    "SELECT id, name FROM planets WHERE guild_id=$1 AND id=$2",
+                    i.guild_id, planet_id)
+                if not planet:
+                    await i.response.send_message(f"Planet ID {planet_id} not found.", ephemeral=True); return
+            else:
+                planet_id = await get_active_planet_id(conn, i.guild_id)
+                planet = await conn.fetchrow(
+                    "SELECT id, name FROM planets WHERE guild_id=$1 AND id=$2",
+                    i.guild_id, planet_id)
+            planet_name = planet["name"] if planet else f"#{planet_id}"
             for unit_name, addr in parsed:
                 await conn.execute(
                     "INSERT INTO enemy_units "
@@ -2066,7 +2170,7 @@ class _BulkSpawnEnemyModal(discord.ui.Modal, title="Bulk Spawn Enemy Units"):
             except Exception:
                 pass
 
-        parts_out = [f"Spawned {len(successes)} enemy unit(s) with **{hp} HP**:"]
+        parts_out = [f"Spawned {len(successes)} enemy unit(s) with **{hp} HP** on **{planet_name}**:"]
         parts_out.extend(successes[:30])
         if len(successes) > 30:
             parts_out.append(f"...and {len(successes) - 30} more.")
@@ -2092,7 +2196,13 @@ class _MoveEnemyModal(discord.ui.Modal, title="Queue Enemy Move"):
             await i.response.send_message("Unit ID must be a number.", ephemeral=True); return
         pool = await get_pool()
         async with pool.acquire() as conn:
-            planet_id = await get_active_planet_id(conn, i.guild_id)
+            # Look up the unit's actual planet rather than defaulting to active planet
+            unit = await conn.fetchrow(
+                "SELECT id, planet_id FROM enemy_units WHERE guild_id=$1 AND id=$2 AND is_active=TRUE",
+                i.guild_id, uid)
+            if not unit:
+                await i.response.send_message(f"Enemy unit {uid} not found or inactive.", ephemeral=True); return
+            planet_id = unit["planet_id"]
             await conn.execute("""
                 INSERT INTO enemy_gm_moves (guild_id, planet_id, enemy_unit_id, target_address)
                 VALUES ($1,$2,$3,$4)
@@ -2118,7 +2228,6 @@ class _BulkMoveEnemyModal(discord.ui.Modal, title="Bulk Queue Enemy Moves"):
         successes = []
         errors    = []
         async with pool.acquire() as conn:
-            planet_id = await get_active_planet_id(conn, i.guild_id)
             for line in raw_lines:
                 line = line.strip()
                 if not line:
@@ -2136,12 +2245,14 @@ class _BulkMoveEnemyModal(discord.ui.Modal, title="Bulk Queue Enemy Moves"):
                 except ValueError:
                     errors.append(f"Non-numeric ID: `{uid_str}`")
                     continue
+                # Resolve planet_id from the unit itself so multi-planet moves work correctly
                 unit = await conn.fetchrow(
-                    "SELECT id FROM enemy_units WHERE guild_id=$1 AND id=$2 AND is_active=TRUE",
+                    "SELECT id, planet_id FROM enemy_units WHERE guild_id=$1 AND id=$2 AND is_active=TRUE",
                     i.guild_id, uid)
                 if not unit:
                     errors.append(f"Unit ID {uid} not found or inactive")
                     continue
+                planet_id = unit["planet_id"]
                 await conn.execute("""
                     INSERT INTO enemy_gm_moves (guild_id, planet_id, enemy_unit_id, target_address)
                     VALUES ($1,$2,$3,$4)

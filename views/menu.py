@@ -55,7 +55,7 @@ class MainMenuView(View):
     async def my_unit(self, i: discord.Interaction, b: Button):
         await _safe(i, _send_unit_panel(i))
 
-    @discord.ui.button(label="📋 Contract",    style=discord.ButtonStyle.secondary, custom_id="menu_status",           row=1)
+    @discord.ui.button(label="📋 Contract Status", style=discord.ButtonStyle.secondary, custom_id="menu_status",       row=1)
     async def war_status(self, i: discord.Interaction, b: Button):
         await _safe(i, _send_contract_board(i))
 
@@ -77,14 +77,42 @@ async def _send_map(i: discord.Interaction):
         theme = await get_theme(conn, i.guild_id)
         try:
             from utils.map_render import render_map_for_guild
-            buf = await render_map_for_guild(i.guild_id, conn)
-            f   = discord.File(buf, filename="warmap.png")
-            embed = discord.Embed(
-                title=f"🗺️  Tactical Map — {theme.get('bot_name','WARBOT')}",
-                color=theme.get("color", 0xAA2222))
-            embed.set_image(url="attachment://warmap.png")
-            embed.set_footer(text=theme.get("flavor_text",""))
-            await i.followup.send(embed=embed, file=f, ephemeral=True)
+            from utils.db import get_active_contract_planet_ids
+
+            # Collect all active-contract planet IDs (may be multiple theatres)
+            active_planet_ids = await get_active_contract_planet_ids(conn, i.guild_id)
+            # Fall back to the guild's configured active planet
+            if not active_planet_ids:
+                from utils.db import get_active_planet_id
+                fallback = await get_active_planet_id(conn, i.guild_id)
+                active_planet_ids = [fallback] if fallback else []
+
+            if not active_planet_ids:
+                await i.followup.send("❌ No active planets found.", ephemeral=True)
+                return
+
+            # Fetch planet names for titles
+            planet_rows = await conn.fetch(
+                "SELECT id, name FROM planets WHERE guild_id=$1 AND id = ANY($2::int[])",
+                i.guild_id, active_planet_ids)
+            planet_names = {r["id"]: r["name"] for r in planet_rows}
+
+            files  = []
+            embeds = []
+            for pid in active_planet_ids:
+                buf  = await render_map_for_guild(i.guild_id, conn, planet_id=pid)
+                name = planet_names.get(pid, f"Planet {pid}")
+                fname = f"warmap_{pid}.png"
+                files.append(discord.File(buf, filename=fname))
+                embed = discord.Embed(
+                    title=f"🗺️  Tactical Map — {name}",
+                    color=theme.get("color", 0xAA2222))
+                embed.set_image(url=f"attachment://{fname}")
+                embed.set_footer(text=theme.get("flavor_text", ""))
+                embeds.append(embed)
+
+            # Discord allows up to 10 embeds per message, 10 files
+            await i.followup.send(embeds=embeds[:10], files=files[:10], ephemeral=True)
         except Exception as e:
             await i.followup.send(f"❌ Map render failed: {e}", ephemeral=True)
 
@@ -275,7 +303,9 @@ def build_public_contract_board_embed(theme: dict, rows, active_enemies: list = 
     """
     The persistent live board posted in the contract channel.
     Shows all contracts as a markdown list. No action buttons — players interact
-    via the 📋 Contract button on the main menu command centre.
+    via the 📋 Contract Status button on the main menu command centre.
+    When multiple planets have active contracts the enemy contacts are grouped
+    by planet so players can immediately see which theatre each contact belongs to.
     """
     bot_name = theme.get("bot_name", "WARBOT")
     embed = discord.Embed(
@@ -285,7 +315,7 @@ def build_public_contract_board_embed(theme: dict, rows, active_enemies: list = 
 
     if not rows:
         embed.description = "*No contracts posted yet. Stand by for GM briefing.*"
-        embed.set_footer(text=f"{bot_name}  ·  Press 📋 Contract on the command centre to interact.")
+        embed.set_footer(text=f"{bot_name}  ·  Press 📋 Contract Status on the command centre to interact.")
         return embed
 
     contract_lines = []
@@ -308,18 +338,38 @@ def build_public_contract_board_embed(theme: dict, rows, active_enemies: list = 
     embed.description = "\n\n".join(contract_lines)
 
     if active_enemies:
-        enemy_lines = []
-        for e in active_enemies[:8]:
-            hp  = e.get("hp", 100)
-            bar = _mini_bar(hp, max_val=100, length=8)
-            enemy_lines.append(f"🔴 **{e['unit_type']}** @ `{e['hex_address']}`  HP `{bar}` {hp}/100")
-        embed.add_field(
-            name="⚠️  Active Enemy Contact",
-            value="\n".join(enemy_lines),
-            inline=False,
-        )
+        # Group enemies by planet if planet_name field is present
+        has_planet_field = hasattr(active_enemies[0], "keys") and "planet_name" in active_enemies[0].keys()
+        if has_planet_field:
+            # Group by planet
+            planet_groups: dict = {}
+            for e in active_enemies[:12]:
+                pname = e.get("planet_name", "Unknown")
+                planet_groups.setdefault(pname, []).append(e)
+            for pname, enemies in planet_groups.items():
+                enemy_lines = []
+                for e in enemies[:6]:
+                    hp  = e.get("hp", 100)
+                    bar = _mini_bar(hp, max_val=100, length=8)
+                    enemy_lines.append(f"🔴 **{e['unit_type']}** @ `{e['hex_address']}`  HP `{bar}` {hp}/100")
+                embed.add_field(
+                    name=f"⚠️  Active Enemy Contact — {pname}",
+                    value="\n".join(enemy_lines),
+                    inline=False,
+                )
+        else:
+            enemy_lines = []
+            for e in active_enemies[:8]:
+                hp  = e.get("hp", 100)
+                bar = _mini_bar(hp, max_val=100, length=8)
+                enemy_lines.append(f"🔴 **{e['unit_type']}** @ `{e['hex_address']}`  HP `{bar}` {hp}/100")
+            embed.add_field(
+                name="⚠️  Active Enemy Contact",
+                value="\n".join(enemy_lines),
+                inline=False,
+            )
 
-    embed.set_footer(text=f"{bot_name}  ·  {len(rows)} contract(s) listed  ·  Use 📋 Contract on the command centre to enlist or deploy.")
+    embed.set_footer(text=f"{bot_name}  ·  {len(rows)} contract(s) listed  ·  Use 📋 Contract Status on the command centre to enlist or deploy.")
     return embed
 
 
@@ -460,15 +510,41 @@ class ContractBoardView(View):
 
 
 async def _send_contract_board(i: discord.Interaction):
-    """Send the ephemeral contract board to the requesting player."""
+    """Send the ephemeral contract board to the requesting player.
+    The overview now mirrors the public board markdown so players see
+    the same rich summary regardless of which channel they use."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         theme = await get_theme(conn, i.guild_id)
         rows  = await fetch_board_contracts(conn, i.guild_id)
 
-    embed = build_contract_board_embed(theme, rows)
+        # Gather active enemy contacts grouped by planet for rich display
+        from utils.db import get_active_contract_planet_ids, get_active_planet_id
+        active_pids = await get_active_contract_planet_ids(conn, i.guild_id)
+        if not active_pids:
+            fallback = await get_active_planet_id(conn, i.guild_id)
+            active_pids = [fallback] if fallback else []
+
+        active_enemies = []
+        if active_pids:
+            active_enemies = list(await conn.fetch(
+                "SELECT eu.unit_type, eu.hex_address, eu.hp, p.name AS planet_name "
+                "FROM enemy_units eu "
+                "JOIN planets p ON p.guild_id=eu.guild_id AND p.id=eu.planet_id "
+                "WHERE eu.guild_id=$1 AND eu.planet_id = ANY($2::int[]) AND eu.is_active=TRUE "
+                "ORDER BY eu.planet_id, eu.id LIMIT 12",
+                i.guild_id, active_pids))
+
+    # Build the same rich public board embed (mirrors the contract board channel)
+    overview_embed = build_public_contract_board_embed(theme, rows, active_enemies)
+    overview_embed.title = "📋  Contract Status"
+    overview_embed.set_footer(text=(
+        f"{theme.get('bot_name','WARBOT')}  ·  {len(rows)} contract(s)  ·  "
+        "Select a contract below for full details and actions."
+    ))
+
     await i.response.send_message(
-        embed=embed,
+        embed=overview_embed,
         view=ContractBoardView(i.guild_id, rows),
         ephemeral=True,
     )
@@ -684,6 +760,22 @@ async def build_menu_embed(guild_id: int, conn, theme: dict = None) -> discord.E
         guild_id, planet_id) or 0
     total_hexes = p_hexes + e_hexes
 
+    # Collect all active-contract planets for multi-theatre display
+    from utils.db import get_active_contract_planet_ids
+    active_theatre_ids = await get_active_contract_planet_ids(conn, guild_id)
+    theatre_rows = []
+    if len(active_theatre_ids) > 1:
+        theatre_rows = await conn.fetch(
+            "SELECT p.id, p.name, p.enemy_type, "
+            "  COUNT(DISTINCT sq.owner_id)::int AS p_units, "
+            "  COUNT(DISTINCT eu.id)::int AS e_units "
+            "FROM planets p "
+            "LEFT JOIN squadrons sq ON sq.guild_id=p.guild_id AND sq.planet_id=p.id AND sq.is_active=TRUE "
+            "LEFT JOIN enemy_units eu ON eu.guild_id=p.guild_id AND eu.planet_id=p.id AND eu.is_active=TRUE "
+            "WHERE p.guild_id=$1 AND p.id = ANY($2::int[]) "
+            "GROUP BY p.id, p.name, p.enemy_type",
+            guild_id, active_theatre_ids)
+
     state         = "🟢 ACTIVE" if is_active else "🔴 STANDBY"
     contract_name = cfg["contract_name"] if cfg and cfg["contract_name"] else "Unassigned"
     bot_name      = theme.get("bot_name", "WARBOT")
@@ -722,6 +814,21 @@ async def build_menu_embed(guild_id: int, conn, theme: dict = None) -> discord.E
         value=f"**{fleets}** fleet(s) available",
         inline=False,
     )
+
+    # Multi-theatre summary when more than one planet has active contracts
+    if theatre_rows and len(theatre_rows) > 1:
+        theatre_lines = []
+        for tr in theatre_rows:
+            theatre_lines.append(
+                f"⚔️ **{tr['name']}** vs {tr['enemy_type']}  ·  "
+                f"🔵 {tr['p_units']} units  ·  🔴 {tr['e_units']} units"
+            )
+        embed.add_field(
+            name=f"🌐  Active Theatres ({len(theatre_rows)})",
+            value="\n".join(theatre_lines),
+            inline=False,
+        )
+
     embed.set_footer(text=f"{theme.get('flavor_text', '')}  ·  Use the buttons below.")
     return embed
 
@@ -1051,13 +1158,23 @@ async def refresh_contract_board(bot, guild_id: int, conn):
         theme = await get_theme(conn, guild_id)
         rows  = await fetch_board_contracts(conn, guild_id)
 
-        planet_id      = await get_active_planet_id(conn, guild_id)
-        active_enemies = await conn.fetch(
-            "SELECT unit_type, hex_address, hp FROM enemy_units "
-            "WHERE guild_id=$1 AND planet_id=$2 AND is_active=TRUE ORDER BY id LIMIT 8",
-            guild_id, planet_id)
+        from utils.db import get_active_contract_planet_ids, get_active_planet_id
+        active_pids = await get_active_contract_planet_ids(conn, guild_id)
+        if not active_pids:
+            fallback = await get_active_planet_id(conn, guild_id)
+            active_pids = [fallback] if fallback else []
 
-        embed = build_public_contract_board_embed(theme, rows, list(active_enemies))
+        active_enemies = []
+        if active_pids:
+            active_enemies = list(await conn.fetch(
+                "SELECT eu.unit_type, eu.hex_address, eu.hp, p.name AS planet_name "
+                "FROM enemy_units eu "
+                "JOIN planets p ON p.guild_id=eu.guild_id AND p.id=eu.planet_id "
+                "WHERE eu.guild_id=$1 AND eu.planet_id = ANY($2::int[]) AND eu.is_active=TRUE "
+                "ORDER BY eu.planet_id, eu.id LIMIT 12",
+                guild_id, active_pids))
+
+        embed = build_public_contract_board_embed(theme, rows, active_enemies)
         await msg.edit(embed=embed, view=None)
     except Exception as e:
         import logging
