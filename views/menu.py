@@ -7,7 +7,7 @@ import random
 import discord
 from discord.ui import View, Button
 
-from utils.db import get_pool, get_theme, get_active_planet_id
+from utils.db import get_pool, get_theme, get_active_planet_id, has_active_contracts
 from utils.brigades import BRIGADES
 
 
@@ -247,47 +247,75 @@ async def fetch_board_contracts(conn, guild_id: int, limit: int = 25):
 
 def _status_icon(status: str) -> str:
     return {
-        "open":       "🔓",
-        "accepting":  "✅",
-        "locked":     "🔒",
-        "deployable": "🚀",
-        "active":     "⚔️",
+        "open":               "🔓",
+        "accepting":          "✅",
+        "locked":             "🔒",
+        "deployable":         "🚀",
+        "active":             "⚔️",
+        "suspended":          "⏸️",
+        "cancelled":          "🚫",
+        "concluded_success":  "🏆",
+        "concluded_failure":  "💀",
     }.get(status, "•")
 
 
-def build_contract_board_embed(theme: dict, rows, selected_id: int = None) -> discord.Embed:
+def build_contract_board_embed(theme: dict, rows, selected_id: int = None,
+                               player_accepted: bool = False) -> discord.Embed:
+    """Build the contract board embed showing the selected contract's full details."""
     embed = discord.Embed(
         title="📋  Contract Board",
         color=theme.get("color", 0xAA2222),
     )
     if not rows:
-        embed.description = "*No contracts on the board yet.*"
+        embed.description = "*No contracts on the board yet. Check back when the GM posts one.*"
+        embed.set_footer(text=theme.get("bot_name", "WARBOT"))
         return embed
 
     selected = next((c for c in rows if c["id"] == selected_id), rows[0])
     cap      = selected["deployment_capacity"] or 0
     dep      = selected["deployed_units"] or 0
     fleets   = selected["fleet_count"] or 0
-    accepted = selected.get("accepted_count", 0) if hasattr(selected, "get") else selected["accepted_count"]
+    accepted = selected.get("accepted_count", 0)
     fill_pct = int(dep / cap * 100) if cap > 0 else 0
-    bar_len  = 12
-    bar_fill = int(bar_len * dep / cap) if cap > 0 else 0
-    dep_bar  = "█" * bar_fill + "░" * (bar_len - bar_fill)
+    bar_fill = int(12 * dep / cap) if cap > 0 else 0
+    dep_bar  = "█" * bar_fill + "░" * (12 - bar_fill)
+    icon     = _status_icon(selected["status"])
 
-    icon = _status_icon(selected["status"])
+    # Header
     embed.description = (
         f"**{icon}  CONTRACT #{selected['id']:03d} — {selected['title']}**\n"
-        f"Planet: **{selected['planet_system']}**  ·  Enemy: **{selected['enemy']}**\n"
+        f"Planet: **{selected['planet_system']}**  ·  Enemy: **{selected['enemy']}**"
+        + (f"\n\n*{selected['description']}*" if selected.get('description') else "")
     )
-    embed.add_field(name="Status",          value=f"{icon} {selected['status'].title()}", inline=True)
-    embed.add_field(name="Signed Up",       value=f"**{accepted}** commandants",          inline=True)
-    embed.add_field(name="Fleets Assigned", value=f"**{fleets}** fleet(s)",               inline=True)
-    embed.add_field(
-        name=f"Deployment  [{dep_bar}]  {dep}/{cap}  ({fill_pct}%)",
-        value="Full" if dep >= cap and cap > 0 else f"{cap - dep} slot(s) remaining",
-        inline=False,
-    )
-    embed.set_footer(text=f"{theme.get('bot_name','WARBOT')} · {len(rows)} contract(s) listed")
+
+    # Status row
+    status_label = selected["status"].replace("_", " ").title()
+    your_status  = "✅ Accepted" if player_accepted else "—"
+    embed.add_field(name="Status",      value=f"{icon} {status_label}", inline=True)
+    embed.add_field(name="Your Status", value=your_status,              inline=True)
+    embed.add_field(name="Sign-ups",    value=f"**{accepted}** commandant(s)", inline=True)
+
+    # Deployment row (only shown once fleets are assigned)
+    if fleets > 0:
+        slots_left = max(0, cap - dep)
+        embed.add_field(
+            name=f"Deployment  [{dep_bar}]  {dep}/{cap}  ({fill_pct}%)",
+            value=(
+                "**All slots filled.**" if slots_left == 0
+                else f"**{slots_left}** slot(s) open  ·  {fleets} fleet(s) assigned"
+            ),
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="Deployment",
+            value="Awaiting GM fleet assignment — sign up now while acceptance is open.",
+            inline=False,
+        )
+
+    total = len(rows)
+    bot   = theme.get("bot_name", "WARBOT")
+    embed.set_footer(text=f"{bot}  ·  {total} contract(s) on board  ·  Use the dropdown to switch")
     return embed
 
 
@@ -310,87 +338,152 @@ class ContractSelect(discord.ui.Select):
         selected_id = int(self.values[0])
         pool = await get_pool()
         async with pool.acquire() as conn:
-            theme = await get_theme(conn, interaction.guild_id)
-            rows  = await fetch_board_contracts(conn, interaction.guild_id)
-        embed = build_contract_board_embed(theme, rows, selected_id)
+            theme    = await get_theme(conn, interaction.guild_id)
+            rows     = await fetch_board_contracts(conn, interaction.guild_id)
+            accepted = await conn.fetchval(
+                "SELECT 1 FROM contract_acceptances "
+                "WHERE guild_id=$1 AND contract_id=$2 AND player_id=$3",
+                interaction.guild_id, selected_id, interaction.user.id)
+        embed = build_contract_board_embed(theme, rows, selected_id, player_accepted=bool(accepted))
         await interaction.response.edit_message(
             embed=embed,
-            view=ContractBoardView(interaction.guild_id, rows, selected_id))
+            view=ContractBoardView(interaction.guild_id, rows, selected_id, player_accepted=bool(accepted)))
 
 
 class ContractBoardView(View):
-    def __init__(self, guild_id: int, rows=None, selected_id: int = None):
-        super().__init__(timeout=180)
-        self.guild_id    = guild_id
-        self.selected_id = selected_id
+    """
+    Player-facing contract board.
+
+    Row 0: [dropdown — select contract]
+    Row 1: [✅ Accept]  [↩️ Withdraw]  [🚀 Deploy Roster]  [⚔️ Enlist New Unit]
+
+    Accept / Withdraw toggle sign-up for the selected contract.
+    Deploy Roster   — redeploy a rostered unit onto a deployable contract.
+    Enlist New Unit — name + brigade picker for a brand-new unit (requires accepted + deployable).
+    """
+
+    def __init__(self, guild_id: int, rows=None, selected_id: int = None,
+                 player_accepted: bool = False):
+        super().__init__(timeout=300)
+        self.guild_id       = guild_id
+        self.selected_id    = selected_id
+        self.player_accepted = player_accepted
         if rows:
             self.add_item(ContractSelect(rows, selected_id))
 
-    @discord.ui.button(label="✅ Accept",        style=discord.ButtonStyle.success, row=1)
-    async def accept_contract(self, i, b):
-        if not self.selected_id:
-            await i.response.send_message("Select a contract first.", ephemeral=True); return
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            c = await fetch_contract(conn, i.guild_id, self.selected_id)
-            if not c:
-                await i.response.send_message("No contract available.", ephemeral=True); return
-            if c["status"] != "accepting":
-                await i.response.send_message("This contract is not accepting sign-ups.", ephemeral=True); return
-            await conn.execute(
-                "INSERT INTO contract_acceptances (guild_id, contract_id, player_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
-                i.guild_id, c['id'], i.user.id)
-        await i.response.send_message(f"✅ Signed up for contract #{c['id']:03d}.", ephemeral=True)
+    # ── internal helpers ──────────────────────────────────────────────────────
 
-    @discord.ui.button(label="Withdraw",         style=discord.ButtonStyle.danger,  row=1)
-    async def withdraw_contract(self, i, b):
+    async def _get_contract(self, i: discord.Interaction):
+        """Return (contract_row, player_accepted) or send an error and return (None, False)."""
         if not self.selected_id:
-            await i.response.send_message("Select a contract first.", ephemeral=True); return
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            c = await fetch_contract(conn, i.guild_id, self.selected_id)
-            if not c:
-                await i.response.send_message("No contract available.", ephemeral=True); return
-            if c["status"] != "accepting":
-                await i.response.send_message("Sign-ups are locked for this contract.", ephemeral=True); return
-            await conn.execute(
-                "DELETE FROM contract_acceptances WHERE guild_id=$1 AND contract_id=$2 AND player_id=$3",
-                i.guild_id, c['id'], i.user.id)
-        await i.response.send_message(f"Withdrawn from contract #{c['id']:03d}.", ephemeral=True)
-
-    @discord.ui.button(label="🚀 Deploy Roster", style=discord.ButtonStyle.primary, row=1)
-    async def deploy_contract(self, i, b):
-        if not self.selected_id:
-            await i.response.send_message("Select a contract first.", ephemeral=True); return
-        from cogs.squadron_cog import open_returning_deploy
-        await open_returning_deploy(i, self.selected_id)
-
-    @discord.ui.button(label="⚔️ New Unit",      style=discord.ButtonStyle.success, row=2)
-    async def new_unit_contract(self, i, b):
-        if not self.selected_id:
-            await i.response.send_message("Select a contract first.", ephemeral=True); return
+            await i.response.send_message("Pick a contract from the dropdown first.", ephemeral=True)
+            return None, False
         pool = await get_pool()
         async with pool.acquire() as conn:
             c        = await fetch_contract(conn, i.guild_id, self.selected_id)
             accepted = await conn.fetchval(
-                "SELECT 1 FROM contract_acceptances WHERE guild_id=$1 AND contract_id=$2 AND player_id=$3",
+                "SELECT 1 FROM contract_acceptances "
+                "WHERE guild_id=$1 AND contract_id=$2 AND player_id=$3",
                 i.guild_id, self.selected_id, i.user.id)
-        if not c or c["status"] not in DEPLOYABLE_STATUSES or not accepted:
+        if not c:
+            await i.response.send_message("Contract not found — it may have been removed.", ephemeral=True)
+            return None, False
+        return c, bool(accepted)
+
+    async def _refresh(self, i: discord.Interaction, accepted: bool):
+        """Edit the current message to reflect a changed acceptance state."""
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            theme = await get_theme(conn, i.guild_id)
+            rows  = await fetch_board_contracts(conn, i.guild_id)
+        embed = build_contract_board_embed(theme, rows, self.selected_id, player_accepted=accepted)
+        view  = ContractBoardView(i.guild_id, rows, self.selected_id, player_accepted=accepted)
+        await i.response.edit_message(embed=embed, view=view)
+
+    # ── buttons ───────────────────────────────────────────────────────────────
+
+    @discord.ui.button(label="✅ Accept", style=discord.ButtonStyle.success, row=1)
+    async def accept_contract(self, i: discord.Interaction, b: Button):
+        c, already = await self._get_contract(i)
+        if c is None: return
+        if c["status"] not in ("accepting", "open"):
             await i.response.send_message(
-                "Select an accepted, fleet-assigned deployable contract first.", ephemeral=True); return
+                f"Sign-ups are **{c['status']}** for this contract.", ephemeral=True); return
+        if already:
+            await i.response.send_message("You have already accepted this contract.", ephemeral=True); return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO contract_acceptances (guild_id, contract_id, player_id) "
+                "VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
+                i.guild_id, c["id"], i.user.id)
+        await self._refresh(i, accepted=True)
+
+    @discord.ui.button(label="↩️ Withdraw", style=discord.ButtonStyle.secondary, row=1)
+    async def withdraw_contract(self, i: discord.Interaction, b: Button):
+        c, accepted = await self._get_contract(i)
+        if c is None: return
+        if c["status"] not in ("accepting", "open"):
+            await i.response.send_message(
+                "Sign-ups are locked — you cannot withdraw now.", ephemeral=True); return
+        if not accepted:
+            await i.response.send_message("You have not accepted this contract.", ephemeral=True); return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM contract_acceptances "
+                "WHERE guild_id=$1 AND contract_id=$2 AND player_id=$3",
+                i.guild_id, c["id"], i.user.id)
+        await self._refresh(i, accepted=False)
+
+    @discord.ui.button(label="🚀 Deploy Roster", style=discord.ButtonStyle.primary, row=1)
+    async def deploy_contract(self, i: discord.Interaction, b: Button):
+        """Redeploy a rostered unit that already exists in the command file."""
+        c, accepted = await self._get_contract(i)
+        if c is None: return
+        if not accepted:
+            await i.response.send_message(
+                "Accept this contract first before deploying.", ephemeral=True); return
+        if c["status"] not in DEPLOYABLE_STATUSES:
+            await i.response.send_message(
+                f"Contract is **{c['status']}** — deployment opens once the GM assigns fleets.",
+                ephemeral=True); return
+        from cogs.squadron_cog import open_returning_deploy
+        await open_returning_deploy(i, self.selected_id)
+
+    @discord.ui.button(label="⚔️ Enlist New Unit", style=discord.ButtonStyle.success, row=1)
+    async def new_unit_contract(self, i: discord.Interaction, b: Button):
+        """Create a brand-new unit for a deployable contract the player has accepted."""
+        c, accepted = await self._get_contract(i)
+        if c is None: return
+        if not accepted:
+            await i.response.send_message(
+                "Accept this contract first, then enlist once fleets are assigned.",
+                ephemeral=True); return
+        if c["status"] not in DEPLOYABLE_STATUSES:
+            await i.response.send_message(
+                f"Contract is **{c['status']}** — fleets must be assigned before enlisting.",
+                ephemeral=True); return
         await i.response.send_modal(_UnitNameModal(i.guild_id, False, self.selected_id))
 
 
 async def _send_contract_board(i: discord.Interaction):
+    """Send the ephemeral contract board to the requesting player."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         theme = await get_theme(conn, i.guild_id)
         rows  = await fetch_board_contracts(conn, i.guild_id)
-    if not rows:
-        await i.response.send_message("No contracts on the board yet.", ephemeral=True); return
-    selected_id = rows[0]["id"]
-    embed = build_contract_board_embed(theme, rows, selected_id)
-    await i.response.send_message(embed=embed, view=ContractBoardView(i.guild_id, rows, selected_id), ephemeral=True)
+        selected_id = rows[0]["id"] if rows else None
+        accepted    = bool(await conn.fetchval(
+            "SELECT 1 FROM contract_acceptances "
+            "WHERE guild_id=$1 AND contract_id=$2 AND player_id=$3",
+            i.guild_id, selected_id, i.user.id)
+        ) if selected_id else False
+    embed = build_contract_board_embed(theme, rows, selected_id, player_accepted=accepted)
+    await i.response.send_message(
+        embed=embed,
+        view=ContractBoardView(i.guild_id, rows, selected_id, player_accepted=accepted),
+        ephemeral=True)
 
 
 # ── Combat log ────────────────────────────────────────────────────────────────
@@ -474,8 +567,9 @@ async def build_menu_embed(guild_id: int, conn, theme: dict = None) -> discord.E
         "SELECT name, contractor, enemy_type FROM planets WHERE guild_id=$1 AND id=$2",
         guild_id, planet_id)
     cfg        = await conn.fetchrow(
-        "SELECT game_started, turn_interval_hours, contract_name, operational_tempo, tempo_threshold, fleet_pool_available FROM guild_config WHERE guild_id=$1",
+        "SELECT turn_interval_hours, contract_name, operational_tempo, tempo_threshold, fleet_pool_available FROM guild_config WHERE guild_id=$1",
         guild_id)
+    is_active  = await has_active_contracts(conn, guild_id)
     turn_count = await conn.fetchval(
         "SELECT COUNT(*) FROM turn_history WHERE guild_id=$1 AND planet_id=$2",
         guild_id, planet_id) or 0
@@ -501,7 +595,7 @@ async def build_menu_embed(guild_id: int, conn, theme: dict = None) -> discord.E
         guild_id, planet_id) or 0
     total_hexes = p_hexes + e_hexes
 
-    state         = "🟢 ACTIVE" if cfg and cfg["game_started"] else "🔴 PAUSED"
+    state         = "🟢 ACTIVE" if is_active else "🔴 STANDBY"
     contract_name = cfg["contract_name"] if cfg and cfg["contract_name"] else "Unassigned"
     bot_name      = theme.get("bot_name", "WARBOT")
     pfac          = theme.get("player_faction", "PMC")
@@ -657,7 +751,7 @@ class EnlistView(View):
 
     @discord.ui.button(label="⚔️ Enlist Now",  style=discord.ButtonStyle.success,   custom_id="enlist_board_enlist")
     async def enlist_now(self, i: discord.Interaction, b: Button):
-        """Open the contract board so the player can pick a contract and enlist."""
+        """Open the contract board so the player can accept a contract and enlist a new unit."""
         await _send_contract_board(i)
 
     @discord.ui.button(label="🚀 Deploy",       style=discord.ButtonStyle.primary,   custom_id="enlist_board_deploy")
@@ -695,9 +789,9 @@ async def refresh_enlist_counter(bot, guild_id: int, conn):
     """Update the persistent enlistment board with current theatre and roster data."""
     try:
         cfg = await conn.fetchrow(
-            "SELECT enlist_channel_id, enlist_message_id, active_planet_id, "
-            "contract_name, game_started "
+            "SELECT enlist_channel_id, enlist_message_id, active_planet_id, contract_name "
             "FROM guild_config WHERE guild_id=$1", guild_id)
+        is_active = await has_active_contracts(conn, guild_id)
         if not cfg or not cfg["enlist_channel_id"] or not cfg["enlist_message_id"]:
             return
         channel = bot.get_channel(cfg["enlist_channel_id"])
@@ -719,7 +813,7 @@ async def refresh_enlist_counter(bot, guild_id: int, conn):
             planet["enemy_type"] if planet else "---",
             count,
             cfg["contract_name"] if cfg and cfg["contract_name"] else "Unassigned",
-            "Active" if cfg and cfg["game_started"] else "Standby",
+            "Active" if is_active else "Standby",
         )
         await msg.edit(embed=embed, view=EnlistView(guild_id))
     except Exception as e:
@@ -743,7 +837,7 @@ async def refresh_contract_board(bot, guild_id: int, conn):
         rows        = await fetch_board_contracts(conn, guild_id)
         selected_id = rows[0]["id"] if rows else None
         embed       = build_contract_board_embed(theme, rows, selected_id)
-        await msg.edit(embed=embed, view=ContractBoardView(guild_id, rows, selected_id))
+        await msg.edit(embed=embed, view=ContractBoardView(guild_id, rows, selected_id, player_accepted=False))
     except Exception as e:
         import logging
         logging.getLogger(__name__).warning(f"Contract board refresh failed: {e}")

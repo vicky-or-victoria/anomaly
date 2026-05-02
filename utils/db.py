@@ -121,6 +121,26 @@ async def get_planet(conn, guild_id: int, planet_id: int):
         "SELECT * FROM planets WHERE guild_id=$1 AND id=$2", guild_id, planet_id)
 
 
+async def has_active_contracts(conn, guild_id: int) -> bool:
+    """True if ANY contract for this guild is currently deployable or active.
+    Replaces the old game_started boolean for deployment-gate checks."""
+    count = await conn.fetchval(
+        "SELECT COUNT(*) FROM contracts "
+        "WHERE guild_id=$1 AND status IN ('deployable','active')",
+        guild_id)
+    return (count or 0) > 0
+
+
+async def get_active_contract_planet_ids(conn, guild_id: int) -> list:
+    """Return the planet_ids of all currently active/deployable contracts.
+    Used to decide which tactical maps to auto-update."""
+    rows = await conn.fetch(
+        "SELECT DISTINCT planet_id FROM contracts "
+        "WHERE guild_id=$1 AND status IN ('deployable','active') AND planet_id IS NOT NULL",
+        guild_id)
+    return [r["planet_id"] for r in rows]
+
+
 def _default_theme() -> dict:
     return {
         "bot_name":       "IRON PACT",

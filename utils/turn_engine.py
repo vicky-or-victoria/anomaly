@@ -385,12 +385,14 @@ class TurnEngine:
         pool = await get_pool()
         async with pool.acquire() as conn:
             guilds = await conn.fetch(
-                "SELECT guild_id, turn_interval_hours, last_turn_at, game_started "
-                "FROM guild_config")
+                "SELECT DISTINCT gc.guild_id, gc.turn_interval_hours, gc.last_turn_at "
+                "FROM guild_config gc "
+                "JOIN contracts c ON c.guild_id=gc.guild_id "
+                "  AND c.status IN ('active','deployable') "
+                "WHERE gc.turn_interval_hours > 0")
         now = datetime.now(timezone.utc)
         for g in guilds:
-            if not g["game_started"]:
-                continue
+            # Active state is now derived from contracts query above
             elapsed = (now - g["last_turn_at"].replace(tzinfo=timezone.utc)).total_seconds()
             if elapsed / 3600 >= g["turn_interval_hours"]:
                 pool = await get_pool()

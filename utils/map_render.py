@@ -948,10 +948,13 @@ def _draw_overview_active_panel(draw, box, active_planet, fonts):
     _overview_text(draw, (x1 + 18, y1 + 16), "ACTIVE THEATRE", fonts["mono"], (145, 145, 145), max_width=x2 - x1 - 36)
     _overview_text(draw, (x1 + 18, y1 + 42), _overview_value(active_planet, "name", "No theatre"), fonts["title"], (232, 232, 232), max_width=x2 - x1 - 36)
 
+    n_con = int(_overview_value(active_planet, "contract_count", 0))
+    engaged = bool(_overview_value(active_planet, "has_active_contract", False))
     fields = [
-        ("Status", "ACTIVE" if active_planet else "NO SIGNAL"),
+        ("Status", ("ENGAGED" if engaged else "STANDBY") if active_planet else "NO SIGNAL"),
         ("Control", _overview_value(active_planet, "contractor")),
         ("Enemy Presence", _overview_value(active_planet, "enemy_type")),
+        ("Active Contracts", str(n_con) if n_con else "—"),
         ("Fleets Assigned", str(_overview_value(active_planet, "fleet_count", 0))),
         ("Units Deployed", f"{_overview_value(active_planet, 'player_units', 0)} / {_overview_value(active_planet, 'deployment_capacity', 0)}"),
         ("Hostile Contacts", str(_overview_value(active_planet, "enemy_units", 0))),
@@ -971,27 +974,57 @@ def _draw_overview_active_panel(draw, box, active_planet, fonts):
 
 
 def _draw_overview_node(draw, x, y, planet, is_active, fonts):
-    r = 16 if is_active else 10
+    """
+    Draw a planet node on the orbit map.
+    is_active = currently selected active planet (admin config)
+    has_contract = planet has at least one active/deployable contract running
+    """
+    has_contract = bool(_overview_value(planet, "has_active_contract", False))
+    r = 16 if is_active else (13 if has_contract else 10)
+
     if is_active:
+        # Active admin planet: bright grey with concentric rings
         for grow, lum in [(22, 34), (16, 52), (10, 76)]:
-            draw.ellipse((x - r - grow, y - r - grow, x + r + grow, y + r + grow), outline=(lum, lum, lum), width=1)
-        draw.ellipse((x - r, y - r, x + r, y + r), fill=(198, 198, 198), outline=(245, 245, 245), width=2)
-        draw.ellipse((x - r - 7, y - r - 7, x + r + 7, y + r + 7), outline=(218, 218, 218), width=2)
+            draw.ellipse((x - r - grow, y - r - grow, x + r + grow, y + r + grow),
+                         outline=(lum, lum, lum), width=1)
+        draw.ellipse((x - r, y - r, x + r, y + r),
+                     fill=(198, 198, 198), outline=(245, 245, 245), width=2)
+        draw.ellipse((x - r - 7, y - r - 7, x + r + 7, y + r + 7),
+                     outline=(218, 218, 218), width=2)
+    elif has_contract:
+        # Has an active contract but is not the admin-selected active planet
+        # Show with a warm amber/gold pulse ring to indicate "war ongoing here"
+        for grow, lum in [(14, 28), (8, 55)]:
+            draw.ellipse((x - r - grow, y - r - grow, x + r + grow, y + r + grow),
+                         outline=(lum + 20, lum, 0), width=1)
+        draw.ellipse((x - r, y - r, x + r, y + r),
+                     fill=(60, 44, 12), outline=(200, 148, 30), width=2)
     else:
-        draw.ellipse((x - r, y - r, x + r, y + r), fill=(8, 8, 9), outline=(112, 112, 112), width=2)
+        draw.ellipse((x - r, y - r, x + r, y + r),
+                     fill=(8, 8, 9), outline=(112, 112, 112), width=2)
 
     tick = 7 if is_active else 5
-    col = (180, 180, 180) if is_active else (78, 78, 78)
-    draw.line((x - r - tick, y, x - r - 2, y), fill=col, width=1)
-    draw.line((x + r + 2, y, x + r + tick, y), fill=col, width=1)
-    draw.line((x, y - r - tick, x, y - r - 2), fill=col, width=1)
-    draw.line((x, y + r + 2, x, y + r + tick), fill=col, width=1)
+    col  = (180, 180, 180) if is_active else ((180, 140, 30) if has_contract else (78, 78, 78))
+    draw.line((x - r - tick, y,   x - r - 2, y),   fill=col, width=1)
+    draw.line((x + r + 2,    y,   x + r + tick, y), fill=col, width=1)
+    draw.line((x, y - r - tick,   x, y - r - 2),    fill=col, width=1)
+    draw.line((x, y + r + 2,      x, y + r + tick), fill=col, width=1)
 
-    name = _overview_value(planet, "name", "Unknown")
-    label_col = (224, 224, 224) if is_active else (126, 126, 126)
+    name      = _overview_value(planet, "name", "Unknown")
+    label_col = (224, 224, 224) if is_active else ((210, 165, 40) if has_contract else (126, 126, 126))
     _overview_text(draw, (x + r + 11, y - 10), name, fonts["body"], label_col, max_width=150)
-    status = "ACTIVE" if is_active else "STANDBY"
-    _overview_text(draw, (x + r + 11, y + 7), status, fonts["mono"], (150, 150, 150) if is_active else (78, 78, 78), max_width=120)
+
+    n_contracts = int(_overview_value(planet, "contract_count", 0))
+    if is_active:
+        status = "ACTIVE"
+        status_col = (150, 150, 150)
+    elif has_contract:
+        status = f"ENGAGED x{n_contracts}" if n_contracts > 1 else "ENGAGED"
+        status_col = (180, 140, 30)
+    else:
+        status = "STANDBY"
+        status_col = (78, 78, 78)
+    _overview_text(draw, (x + r + 11, y + 7), status, fonts["mono"], status_col, max_width=120)
 
 
 def _draw_overview_orbit_map(draw, planets, active_planet_id, box, fonts):
@@ -1026,9 +1059,13 @@ def _draw_overview_orbit_map(draw, planets, active_planet_id, box, fonts):
         ry = int(max_ry * ring_fracs[ring_idx])
         px = int(cx + math.cos(angle) * rx)
         py = int(cy + math.sin(angle) * ry)
-        is_active = _overview_value(planet, "id") == active_planet_id
+        is_active    = _overview_value(planet, "id") == active_planet_id
+        has_contract = bool(_overview_value(planet, "has_active_contract", False))
         if is_active:
             draw.line((cx, cy, px, py), fill=(74, 74, 74), width=1)
+        elif has_contract:
+            # Draw a faint amber line to show the system is engaged
+            draw.line((cx, cy, px, py), fill=(60, 48, 12), width=1)
         _draw_overview_node(draw, px, py, planet, is_active, fonts)
 
 
@@ -1055,10 +1092,43 @@ def _draw_overview_bottom_cards(draw, planets, active_planet_id, box, fonts):
         draw.rectangle((cx, top, cx + card_w, top + card_h), fill=fill, outline=edge, width=2 if active else 1)
         if active:
             draw.rectangle((cx, top, cx + 4, top + card_h), fill=(184, 184, 184))
-        _overview_text(draw, (cx + 12, top + 8), _overview_value(planet, "name", "Unknown"), fonts["head"], (224, 224, 224) if active else (150, 150, 150), max_width=card_w - 24)
-        _overview_text(draw, (cx + 12, top + 31), "ACTIVE" if active else "STANDBY", fonts["mono"], (200, 200, 200) if active else (88, 88, 88), max_width=card_w - 24)
-        _overview_text(draw, (cx + 12, top + 51), f"C: {_overview_value(planet, 'contractor')}", fonts["small"], (160, 160, 160), max_width=card_w - 24)
-        _overview_text(draw, (cx + 12, top + 67), f"E: {_overview_value(planet, 'enemy_type')}", fonts["small"], (145, 145, 145), max_width=card_w - 24)
+        has_contract = bool(_overview_value(planet, "has_active_contract", False))
+        n_contracts  = int(_overview_value(planet, "contract_count", 0))
+        deployed     = int(_overview_value(planet, "deployed_units", 0))
+        cap          = int(_overview_value(planet, "deployment_capacity", 0))
+
+        # Card edge accent: grey=admin-active, amber=contract-engaged, dark=standby
+        if active:
+            draw.rectangle((cx, top, cx + 4, top + card_h), fill=(184, 184, 184))
+            status_str = "ACTIVE"
+            status_col = (200, 200, 200)
+        elif has_contract:
+            draw.rectangle((cx, top, cx + 4, top + card_h), fill=(160, 120, 24))
+            status_str = f"ENGAGED x{n_contracts}" if n_contracts > 1 else "ENGAGED"
+            status_col = (180, 140, 30)
+        else:
+            status_str = "STANDBY"
+            status_col = (88, 88, 88)
+
+        _overview_text(draw, (cx + 12, top + 8),
+            _overview_value(planet, "name", "Unknown"), fonts["head"],
+            (224, 224, 224) if active else ((200, 160, 50) if has_contract else (150, 150, 150)),
+            max_width=card_w - 24)
+        _overview_text(draw, (cx + 12, top + 31), status_str, fonts["mono"], status_col,
+            max_width=card_w - 24)
+        _overview_text(draw, (cx + 12, top + 51),
+            f"C: {_overview_value(planet, 'contractor')}", fonts["small"],
+            (160, 160, 160), max_width=card_w - 24)
+        _overview_text(draw, (cx + 12, top + 67),
+            f"E: {_overview_value(planet, 'enemy_type')}", fonts["small"],
+            (145, 145, 145), max_width=card_w - 24)
+        if has_contract and cap > 0:
+            dep_str = f"Dep: {deployed}/{cap}"
+            _overview_text(draw, (cx + 12, top + 83), dep_str, fonts["small"],
+                (120, 160, 120), max_width=card_w - 24)
+        elif has_contract:
+            _overview_text(draw, (cx + 12, top + 83), "Awaiting fleets", fonts["small"],
+                (140, 110, 40), max_width=card_w - 24)
 
 
 def render_planetary_system_overview(
@@ -1691,6 +1761,16 @@ async def render_gm_map_for_guild(guild_id: int, conn, planet_id: int = None,
 
 
 async def render_overview_for_guild(guild_id: int, conn) -> io.BytesIO:
+    """
+    Build the system overview image.
+
+    Each planet card now shows:
+      - Active contract count + status badge (ACTIVE / STANDBY)
+      - Fleet count and deployment fill bar (when contracts are running)
+      - Player and enemy unit totals
+    Contracts are matched first by planet_id FK (reliable), then by planet_system
+    name (backwards compat for contracts created before the planet_id column).
+    """
     from utils.db import get_theme, get_active_planet_id
     theme     = await get_theme(conn, guild_id)
     active_id = await get_active_planet_id(conn, guild_id)
@@ -1699,35 +1779,68 @@ async def render_overview_for_guild(guild_id: int, conn) -> io.BytesIO:
         "WHERE guild_id=$1 ORDER BY sort_order, id", guild_id)
     turn_count = await conn.fetchval(
         "SELECT COUNT(*) FROM turn_history WHERE guild_id=$1", guild_id) or 0
+
     player_counts = await conn.fetch(
         "SELECT planet_id, COUNT(*) AS count FROM squadrons "
         "WHERE guild_id=$1 AND is_active=TRUE GROUP BY planet_id", guild_id)
     enemy_counts = await conn.fetch(
         "SELECT planet_id, COUNT(*) AS count FROM enemy_units "
         "WHERE guild_id=$1 AND is_active=TRUE GROUP BY planet_id", guild_id)
-    contract_rows = await conn.fetch(
+
+    # Contract stats — join by planet_id where set, fall back to planet_system name
+    contract_rows_by_id = await conn.fetch(
         """
-        SELECT planet_system,
-               SUM(fleet_count)::INT AS fleet_count,
-               SUM(deployment_capacity)::INT AS deployment_capacity
+        SELECT planet_id,
+               COUNT(*)::INT                    AS contract_count,
+               SUM(fleet_count)::INT            AS fleet_count,
+               SUM(deployment_capacity)::INT    AS deployment_capacity,
+               SUM(deployed_units)::INT         AS deployed_units,
+               MAX(CASE WHEN status='active'     THEN 1 ELSE 0 END)::INT AS has_active,
+               MAX(CASE WHEN status='deployable' THEN 1 ELSE 0 END)::INT AS has_deployable
         FROM contracts
         WHERE guild_id=$1
-          AND status IN ('deployable','active')
+          AND status IN ('accepting','locked','deployable','active')
+          AND planet_id IS NOT NULL
+        GROUP BY planet_id
+        """,
+        guild_id)
+    contract_rows_by_name = await conn.fetch(
+        """
+        SELECT planet_system,
+               COUNT(*)::INT                    AS contract_count,
+               SUM(fleet_count)::INT            AS fleet_count,
+               SUM(deployment_capacity)::INT    AS deployment_capacity,
+               SUM(deployed_units)::INT         AS deployed_units,
+               MAX(CASE WHEN status='active'     THEN 1 ELSE 0 END)::INT AS has_active,
+               MAX(CASE WHEN status='deployable' THEN 1 ELSE 0 END)::INT AS has_deployable
+        FROM contracts
+        WHERE guild_id=$1
+          AND status IN ('accepting','locked','deployable','active')
+          AND planet_id IS NULL
         GROUP BY planet_system
         """,
         guild_id)
-    players_by_planet = {row["planet_id"]: row["count"] for row in player_counts}
-    enemies_by_planet = {row["planet_id"]: row["count"] for row in enemy_counts}
-    contracts_by_system = {row["planet_system"]: row for row in contract_rows}
+
+    players_by_planet   = {r["planet_id"]: r["count"] for r in player_counts}
+    enemies_by_planet   = {r["planet_id"]: r["count"] for r in enemy_counts}
+    contracts_by_pid    = {r["planet_id"]: r for r in contract_rows_by_id}
+    contracts_by_name   = {r["planet_system"]: r for r in contract_rows_by_name}
+
     overview_planets = []
     for planet in planets:
         item = dict(planet)
         item["player_units"] = int(players_by_planet.get(item["id"], 0) or 0)
-        item["enemy_units"] = int(enemies_by_planet.get(item["id"], 0) or 0)
-        cstats = contracts_by_system.get(item["name"])
-        item["fleet_count"] = int(cstats["fleet_count"] if cstats else 0)
-        item["deployment_capacity"] = int(cstats["deployment_capacity"] if cstats else 0)
+        item["enemy_units"]  = int(enemies_by_planet.get(item["id"],  0) or 0)
+
+        # Prefer planet_id match; fall back to name match
+        cstats = contracts_by_pid.get(item["id"]) or contracts_by_name.get(item["name"])
+        item["fleet_count"]          = int(cstats["fleet_count"]         if cstats else 0)
+        item["deployment_capacity"]  = int(cstats["deployment_capacity"] if cstats else 0)
+        item["deployed_units"]       = int(cstats["deployed_units"]      if cstats else 0)
+        item["contract_count"]       = int(cstats["contract_count"]      if cstats else 0)
+        item["has_active_contract"]  = bool(cstats and (cstats["has_active"] or cstats["has_deployable"]))
         overview_planets.append(item)
+
     return render_planetary_system_overview(overview_planets, active_id, theme, int(turn_count) + 1)
 
 

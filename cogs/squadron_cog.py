@@ -12,7 +12,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from utils.db import get_pool, ensure_guild, get_theme, get_active_planet_id
+from utils.db import get_pool, ensure_guild, get_theme, get_active_planet_id, has_active_contracts
 from utils.hexmap import (
     hex_key, parse_hex, hex_neighbors, is_valid, GRID_SET,
     hex_distance, DIRECTIONS, DIR_NAMES,
@@ -553,8 +553,7 @@ class DeployModal(discord.ui.Modal, title="Deploy Your Unit"):
         async with pool.acquire() as conn:
             theme     = await get_theme(conn, self.guild_id)
             planet_id = await get_active_planet_id(conn, self.guild_id)
-            cfg_state = await conn.fetchrow("SELECT game_started FROM guild_config WHERE guild_id=$1", self.guild_id)
-            if not cfg_state or not cfg_state['game_started']:
+            if not await has_active_contracts(conn, self.guild_id):
                 await interaction.followup.send("No active contract is accepting deployments yet.", ephemeral=True); return
             active_contract = await conn.fetchrow(
                 "SELECT id, deployment_capacity, deployed_units, fleet_count, status "
@@ -722,9 +721,7 @@ class ExistingDeployModal(discord.ui.Modal, title="Deploy Existing Unit"):
         async with pool.acquire() as conn:
             theme = await get_theme(conn, self.guild_id)
             planet_id = await get_active_planet_id(conn, self.guild_id)
-            cfg = await conn.fetchrow(
-                "SELECT game_started FROM guild_config WHERE guild_id=$1", self.guild_id)
-            if not cfg or not cfg["game_started"]:
+            if not await has_active_contracts(conn, self.guild_id):
                 await interaction.followup.send(
                     "No active contract is accepting deployments yet.", ephemeral=True)
                 return
@@ -865,9 +862,7 @@ async def open_returning_deploy(interaction: discord.Interaction, contract_id: i
     async with pool.acquire() as conn:
         theme = await get_theme(conn, interaction.guild_id)
         planet_id = await get_active_planet_id(conn, interaction.guild_id)
-        cfg = await conn.fetchrow(
-            "SELECT game_started FROM guild_config WHERE guild_id=$1", interaction.guild_id)
-        if not cfg or not cfg["game_started"]:
+        if not await has_active_contracts(conn, interaction.guild_id):
             await interaction.response.send_message(
                 "No active contract is accepting deployments yet.", ephemeral=True)
             return

@@ -351,3 +351,20 @@ EXCEPTION WHEN duplicate_table THEN NULL; END $$;
 DO $$ BEGIN
     CREATE INDEX IF NOT EXISTS idx_arrows_gp ON movement_arrows(guild_id, planet_id);
 EXCEPTION WHEN duplicate_table THEN NULL; END $$;
+
+-- v6: multi-contract support ────────────────────────────────────────────────
+-- Add planet_id to contracts so maps can be keyed per-planet
+DO $$ BEGIN ALTER TABLE contracts ADD COLUMN IF NOT EXISTS planet_id INT DEFAULT NULL; END $$;
+
+-- Per-planet persistent map message tracking (replaces single map_message_id)
+CREATE TABLE IF NOT EXISTS planet_map_messages (
+    guild_id    BIGINT NOT NULL,
+    planet_id   INT    NOT NULL,
+    message_id  BIGINT NOT NULL,
+    channel_id  BIGINT NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (guild_id, planet_id)
+);
+
+-- Drop game_started dependency: derive active state from contracts instead
+-- (game_started kept for admin reset; no longer set by contract lifecycle)
