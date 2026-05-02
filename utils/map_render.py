@@ -1073,14 +1073,15 @@ def _draw_overview_orbit_map(draw, planets, active_planet_id, box, fonts, moons_
         planet_id = _overview_value(planet, "id")
         moons = moons_by_planet.get(planet_id, [])
         planet_r = 16 if is_active else (13 if has_contract else 10)
-        # Push orbit radius well clear of the planet's text labels (which extend ~150px right)
-        # Place moons below/above the planet to avoid the rightward label zone
-        moon_orbit = planet_r + 32
-        for m_idx, moon_name in enumerate(moons[:4]):  # max 4 moons rendered
-            # Angle moons downward from the planet (below in screen space) so they
-            # don't collide with the name/status labels that extend to the right
-            base_angle = angle + math.pi * 0.6  # start below-right
-            m_angle = base_angle + (math.pi * 0.5 * m_idx / max(len(moons), 1))
+        # Moon orbit: fixed absolute radius so moons always sit below the planet,
+        # well clear of the rightward name/status text (which starts at x+r+11 going right).
+        # We use straight-down (pi/2) as the base direction so moons never enter
+        # the rightward label zone regardless of where the planet sits on the canvas.
+        moon_orbit = 48
+        for m_idx, moon_name in enumerate(moons[:4]):
+            # Centre moons directly below the planet, spread symmetrically for multiple moons
+            spread = math.pi * 0.22  # ~40 degrees between moons
+            m_angle = math.pi / 2 + (m_idx - (len(moons) - 1) / 2.0) * spread
             mx = int(px + math.cos(m_angle) * moon_orbit)
             my = int(py + math.sin(m_angle) * moon_orbit)
             mr = 4
@@ -1088,7 +1089,7 @@ def _draw_overview_orbit_map(draw, planets, active_planet_id, box, fonts, moons_
             draw.ellipse((px - moon_orbit, py - moon_orbit, px + moon_orbit, py + moon_orbit),
                          outline=(38, 38, 48), width=1)
             if is_active:
-                # Main Base moon: bright concentric glow rings — the visual "special" marker
+                # Main Base moon: concentric glow rings — the visual "special" marker
                 for grow, lum in [(10, 38), (7, 62), (4, 100)]:
                     draw.ellipse((mx - mr - grow, my - mr - grow,
                                   mx + mr + grow, my + mr + grow),
@@ -1098,7 +1099,7 @@ def _draw_overview_orbit_map(draw, planets, active_planet_id, box, fonts, moons_
             else:
                 draw.ellipse((mx - mr, my - mr, mx + mr, my + mr),
                              fill=(72, 72, 76), outline=(140, 140, 148), width=1)
-            # Label below the moon so it doesn't overlap the planet text
+            # Label centred below the moon dot
             _overview_text(draw, (mx - 20, my + mr + 4), moon_name, fonts["mono"],
                            (200, 210, 230) if is_active else (108, 108, 116), max_width=80)
 
