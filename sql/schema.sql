@@ -382,3 +382,34 @@ CREATE TABLE IF NOT EXISTS fleet_votes (
     voted_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (guild_id, player_id)
 );
+-- v8: Planet Moons ────────────────────────────────────────────────────────
+-- Moons are purely cosmetic/lore bodies that orbit planets in the system map
+CREATE TABLE IF NOT EXISTS planet_moons (
+    id          SERIAL      PRIMARY KEY,
+    guild_id    BIGINT      NOT NULL,
+    planet_id   INT         NOT NULL,
+    name        TEXT        NOT NULL,
+    description TEXT        DEFAULT NULL,
+    UNIQUE(guild_id, planet_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_moons_gp ON planet_moons(guild_id, planet_id);
+-- Migration guard
+DO $$ BEGIN
+    CREATE TABLE IF NOT EXISTS planet_moons (
+        id          SERIAL      PRIMARY KEY,
+        guild_id    BIGINT      NOT NULL,
+        planet_id   INT         NOT NULL,
+        name        TEXT        NOT NULL,
+        description TEXT        DEFAULT NULL,
+        UNIQUE(guild_id, planet_id, name)
+    );
+EXCEPTION WHEN duplicate_table THEN NULL; END $$;
+
+-- Seed: Add default moon to Terra Prime if it exists (cosmetic only)
+DO $$ BEGIN
+    INSERT INTO planet_moons (guild_id, planet_id, name, description)
+    SELECT p.guild_id, p.id, 'Selene', 'Barren orbital body — used as a forward relay station'
+    FROM planets p
+    WHERE LOWER(p.name) = 'terra prime'
+    ON CONFLICT (guild_id, planet_id, name) DO NOTHING;
+END $$;

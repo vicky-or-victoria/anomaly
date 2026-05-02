@@ -945,7 +945,7 @@ def _draw_overview_active_panel(draw, box, active_planet, fonts):
     x1, y1, x2, y2 = box
     draw.rectangle(box, fill=(12, 12, 13), outline=(66, 66, 66))
     draw.rectangle((x1, y1, x1 + 5, y2), fill=(138, 138, 138))
-    _overview_text(draw, (x1 + 18, y1 + 16), "ACTIVE THEATRE", fonts["mono"], (145, 145, 145), max_width=x2 - x1 - 36)
+    _overview_text(draw, (x1 + 18, y1 + 16), "MAIN BASE", fonts["mono"], (145, 145, 145), max_width=x2 - x1 - 36)
     _overview_text(draw, (x1 + 18, y1 + 42), _overview_value(active_planet, "name", "No theatre"), fonts["title"], (232, 232, 232), max_width=x2 - x1 - 36)
 
     n_con = int(_overview_value(active_planet, "contract_count", 0))
@@ -1015,19 +1015,21 @@ def _draw_overview_node(draw, x, y, planet, is_active, fonts):
     _overview_text(draw, (x + r + 11, y - 10), name, fonts["body"], label_col, max_width=150)
 
     n_contracts = int(_overview_value(planet, "contract_count", 0))
-    if is_active:
-        status = "ACTIVE"
-        status_col = (150, 150, 150)
-    elif has_contract:
+    if has_contract:
         status = f"ENGAGED x{n_contracts}" if n_contracts > 1 else "ENGAGED"
         status_col = (180, 140, 30)
     else:
         status = "STANDBY"
         status_col = (78, 78, 78)
+    # Show MAIN BASE badge below status for the admin-selected planet
     _overview_text(draw, (x + r + 11, y + 7), status, fonts["mono"], status_col, max_width=120)
+    if is_active:
+        _overview_text(draw, (x + r + 11, y + 20), "★ MAIN BASE", fonts["mono"], (150, 150, 150), max_width=120)
 
 
-def _draw_overview_orbit_map(draw, planets, active_planet_id, box, fonts):
+def _draw_overview_orbit_map(draw, planets, active_planet_id, box, fonts, moons_by_planet=None):
+    if moons_by_planet is None:
+        moons_by_planet = {}
     x1, y1, x2, y2 = box
     draw.rectangle(box, outline=(38, 38, 38))
     cx = (x1 + x2) // 2
@@ -1068,6 +1070,23 @@ def _draw_overview_orbit_map(draw, planets, active_planet_id, box, fonts):
             draw.line((cx, cy, px, py), fill=(60, 48, 12), width=1)
         _draw_overview_node(draw, px, py, planet, is_active, fonts)
 
+        # Draw moons orbiting this planet
+        planet_id = _overview_value(planet, "id")
+        moons = moons_by_planet.get(planet_id, [])
+        planet_r = 16 if is_active else (13 if has_contract else 10)
+        moon_orbit = planet_r + 18
+        for m_idx, moon_name in enumerate(moons[:4]):  # max 4 moons rendered
+            m_angle = angle + math.pi / 2 + (2 * math.pi * m_idx / max(len(moons), 1))
+            mx = int(px + math.cos(m_angle) * moon_orbit)
+            my = int(py + math.sin(m_angle) * moon_orbit)
+            mr = 4
+            # Moon orbit ring (faint dashed look using a thin ellipse)
+            draw.ellipse((px - moon_orbit, py - moon_orbit, px + moon_orbit, py + moon_orbit),
+                         outline=(38, 38, 42), width=1)
+            draw.ellipse((mx - mr, my - mr, mx + mr, my + mr),
+                         fill=(72, 72, 76), outline=(140, 140, 148), width=1)
+            _overview_text(draw, (mx + mr + 3, my - 6), moon_name, fonts["mono"], (108, 108, 116), max_width=80)
+
 
 def _draw_overview_bottom_cards(draw, planets, active_planet_id, box, fonts):
     x1, y1, x2, y2 = box
@@ -1097,10 +1116,14 @@ def _draw_overview_bottom_cards(draw, planets, active_planet_id, box, fonts):
         deployed     = int(_overview_value(planet, "deployed_units", 0))
         cap          = int(_overview_value(planet, "deployment_capacity", 0))
 
-        # Card edge accent: grey=admin-active, amber=contract-engaged, dark=standby
-        if active:
+        # Card edge accent: grey=main-base, amber=contract-engaged, dark=standby
+        if active and has_contract:
             draw.rectangle((cx, top, cx + 4, top + card_h), fill=(184, 184, 184))
-            status_str = "ACTIVE"
+            status_str = f"ENGAGED x{n_contracts}" if n_contracts > 1 else "ENGAGED"
+            status_col = (180, 140, 30)
+        elif active:
+            draw.rectangle((cx, top, cx + 4, top + card_h), fill=(184, 184, 184))
+            status_str = "STANDBY"
             status_col = (200, 200, 200)
         elif has_contract:
             draw.rectangle((cx, top, cx + 4, top + card_h), fill=(160, 120, 24))
@@ -1114,20 +1137,28 @@ def _draw_overview_bottom_cards(draw, planets, active_planet_id, box, fonts):
             _overview_value(planet, "name", "Unknown"), fonts["head"],
             (224, 224, 224) if active else ((200, 160, 50) if has_contract else (150, 150, 150)),
             max_width=card_w - 24)
-        _overview_text(draw, (cx + 12, top + 31), status_str, fonts["mono"], status_col,
-            max_width=card_w - 24)
-        _overview_text(draw, (cx + 12, top + 51),
+        if active:
+            _overview_text(draw, (cx + 12, top + 27), "★ MAIN BASE", fonts["mono"], (150, 150, 150),
+                max_width=card_w - 24)
+            _overview_text(draw, (cx + 12, top + 41), status_str, fonts["mono"], status_col,
+                max_width=card_w - 24)
+            text_offset = 61
+        else:
+            _overview_text(draw, (cx + 12, top + 31), status_str, fonts["mono"], status_col,
+                max_width=card_w - 24)
+            text_offset = 51
+        _overview_text(draw, (cx + 12, top + text_offset),
             f"C: {_overview_value(planet, 'contractor')}", fonts["small"],
             (160, 160, 160), max_width=card_w - 24)
-        _overview_text(draw, (cx + 12, top + 67),
+        _overview_text(draw, (cx + 12, top + text_offset + 16),
             f"E: {_overview_value(planet, 'enemy_type')}", fonts["small"],
             (145, 145, 145), max_width=card_w - 24)
         if has_contract and cap > 0:
             dep_str = f"Dep: {deployed}/{cap}"
-            _overview_text(draw, (cx + 12, top + 83), dep_str, fonts["small"],
+            _overview_text(draw, (cx + 12, top + text_offset + 32), dep_str, fonts["small"],
                 (120, 160, 120), max_width=card_w - 24)
         elif has_contract:
-            _overview_text(draw, (cx + 12, top + 83), "Awaiting fleets", fonts["small"],
+            _overview_text(draw, (cx + 12, top + text_offset + 32), "Awaiting fleets", fonts["small"],
                 (140, 110, 40), max_width=card_w - 24)
 
 
@@ -1136,9 +1167,12 @@ def render_planetary_system_overview(
     active_planet_id: int,
     theme:            dict = None,
     turn_number:      int = 0,
+    moons_by_planet:  dict = None,
 ) -> io.BytesIO:
     if theme is None:
         theme = _default_theme()
+    if moons_by_planet is None:
+        moons_by_planet = {}
 
     planets = planets or []
     active_planet = next((p for p in planets if _overview_value(p, "id") == active_planet_id), None)
@@ -1168,7 +1202,7 @@ def render_planetary_system_overview(
     orbit_bounds = (350, top, W - 28, H - bottom_cards_h - 24)
 
     _draw_overview_active_panel(draw, left_panel, active_planet, fonts)
-    _draw_overview_orbit_map(draw, planets, active_planet_id, orbit_bounds, fonts)
+    _draw_overview_orbit_map(draw, planets, active_planet_id, orbit_bounds, fonts, moons_by_planet)
     _draw_overview_bottom_cards(draw, planets, active_planet_id, (28, H - bottom_cards_h + 8, W - 28, H - 24), fonts)
 
     draw.rectangle((1, 1, W - 2, H - 2), outline=(64, 64, 64), width=2)
@@ -1841,7 +1875,16 @@ async def render_overview_for_guild(guild_id: int, conn) -> io.BytesIO:
         item["has_active_contract"]  = bool(cstats and (cstats["has_active"] or cstats["has_deployable"]))
         overview_planets.append(item)
 
-    return render_planetary_system_overview(overview_planets, active_id, theme, int(turn_count) + 1)
+    # Fetch moons grouped by planet_id
+    moon_rows = await conn.fetch(
+        "SELECT planet_id, name FROM planet_moons WHERE guild_id=$1 ORDER BY planet_id, id",
+        guild_id)
+    moons_by_planet: dict = {}
+    for m in moon_rows:
+        moons_by_planet.setdefault(m["planet_id"], []).append(m["name"])
+
+    return render_planetary_system_overview(overview_planets, active_id, theme, int(turn_count) + 1,
+                                            moons_by_planet=moons_by_planet)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

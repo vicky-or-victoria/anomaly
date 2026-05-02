@@ -94,7 +94,7 @@ def _admin_panel_embed(theme: dict) -> discord.Embed:
             "**Game Control**\n"
             "Status · Turn Interval · Force Turn · **Reset Menu**\n\n"
             "**Planets**\n"
-            "List · Add · Remove · Set Active · Edit\n\n"
+            "List · Add · Remove · Set Main Base · Edit · Moons\n\n"
             "**Theme & Appearance**\n"
             "View Theme · Set Theme · Set Color\n\n"
             "**Channels & Roles**\n"
@@ -218,7 +218,7 @@ class AdminPanelView(discord.ui.View):
             title=f"{theme.get('bot_name','WARBOT')} — Planetary Theatres",
             color=theme.get("color", 0xAA2222),
             description="\n\n".join(lines))
-        embed.set_footer(text="> = Active Theatre")
+        embed.set_footer(text="> = Main Base")
         await i.response.send_message(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="➕ Add Planet", style=discord.ButtonStyle.secondary, row=1)
@@ -227,7 +227,7 @@ class AdminPanelView(discord.ui.View):
             await i.response.send_message("Admins only.", ephemeral=True); return
         await i.response.send_modal(_PlanetAddModal())
 
-    @discord.ui.button(label="🌐 Set Active Planet", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(label="🌐 Set Main Base", style=discord.ButtonStyle.primary, row=1)
     async def planet_set_active(self, i: discord.Interaction, b: discord.ui.Button):
         if not await _is_admin(self.bot, i):
             await i.response.send_message("Admins only.", ephemeral=True); return
@@ -245,6 +245,38 @@ class AdminPanelView(discord.ui.View):
         if not await _is_admin(self.bot, i):
             await i.response.send_message("Admins only.", ephemeral=True); return
         await i.response.send_modal(_PlanetRemoveModal())
+
+    async def moon_add(self, i: discord.Interaction, b: discord.ui.Button):
+        if not await _is_admin(self.bot, i):
+            await i.response.send_message("Admins only.", ephemeral=True); return
+        await i.response.send_modal(_MoonAddModal())
+
+    async def moon_remove(self, i: discord.Interaction, b: discord.ui.Button):
+        if not await _is_admin(self.bot, i):
+            await i.response.send_message("Admins only.", ephemeral=True); return
+        await i.response.send_modal(_MoonRemoveModal())
+
+    async def moon_list(self, i: discord.Interaction, b: discord.ui.Button):
+        await ensure_guild(i.guild_id)
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT p.name AS planet_name, m.name AS moon_name, m.description "
+                "FROM planet_moons m JOIN planets p ON p.id=m.planet_id AND p.guild_id=m.guild_id "
+                "WHERE m.guild_id=$1 ORDER BY p.sort_order, p.id, m.id",
+                i.guild_id)
+        if not rows:
+            await i.response.send_message("No moons configured.", ephemeral=True); return
+        lines = []
+        current_planet = None
+        for r in rows:
+            if r["planet_name"] != current_planet:
+                current_planet = r["planet_name"]
+                lines.append(f"\n**{current_planet}**")
+            desc = f" — {r['description']}" if r["description"] else ""
+            lines.append(f"  🌙 {r['moon_name']}{desc}")
+        embed = discord.Embed(title="🌙 Planet Moons", description="\n".join(lines), color=0x444466)
+        await i.response.send_message(embed=embed, ephemeral=True)
 
     # ──── Row 2: Theme ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -493,7 +525,7 @@ class GmPanelView(discord.ui.View):
             title="📋  Create Contract — Select Planet",
             description=(
                 "Choose which planetary theatre this contract is for.\n"
-                "★ marks the currently active planet.\n\n"
+                "★ marks the current Main Base planet.\n\n"
                 "The contract details modal will open after your selection."
             ),
             color=0xAA2222,
@@ -802,9 +834,12 @@ class AdminPanelPagerView(_PagedPanelView):
                 "items": [
                     {"label": "List Planets", "method": "planet_list"},
                     {"label": "Add Planet", "method": "planet_add"},
-                    {"label": "Set Active", "method": "planet_set_active", "style": discord.ButtonStyle.primary},
+                    {"label": "Set Main Base", "method": "planet_set_active", "style": discord.ButtonStyle.primary},
                     {"label": "Edit Planet", "method": "planet_edit"},
                     {"label": "Remove Planet", "method": "planet_remove", "style": discord.ButtonStyle.danger},
+                    {"label": "🌙 Add Moon", "method": "moon_add", "style": discord.ButtonStyle.secondary},
+                    {"label": "🌙 Remove Moon", "method": "moon_remove", "style": discord.ButtonStyle.danger},
+                    {"label": "🌙 List Moons", "method": "moon_list"},
                 ],
             },
             {
@@ -1054,7 +1089,7 @@ class _PlanetAddModal(discord.ui.Modal, title="Add Planet"):
         await _refresh_public_surfaces(i.client, i.guild_id)
 
 
-class _PlanetSetActiveModal(discord.ui.Modal, title="Set Active Planet"):
+class _PlanetSetActiveModal(discord.ui.Modal, title="Set Main Base"):
     planet_name = discord.ui.TextInput(label="Planet Name", max_length=40)
 
     def __init__(self, bot):
@@ -1075,7 +1110,7 @@ class _PlanetSetActiveModal(discord.ui.Modal, title="Set Active Planet"):
             await conn.execute(
                 "UPDATE guild_config SET active_planet_id=$1 WHERE guild_id=$2",
                 planet["id"], i.guild_id)
-        await i.response.send_message(f"Active theatre: **{planet['name']}**.", ephemeral=True)
+        await i.response.send_message(f"Main Base set to: **{planet["name"]}**.", ephemeral=True)
         await _refresh_public_surfaces(self.bot, i.guild_id)
 
 
@@ -1104,6 +1139,67 @@ class _PlanetRemoveModal(discord.ui.Modal, title="Remove Planet"):
             await conn.execute(
                 "DELETE FROM planets WHERE guild_id=$1 AND id=$2", i.guild_id, pid)
         await i.response.send_message(f"Planet **{name}** removed.", ephemeral=True)
+        await _refresh_public_surfaces(i.client, i.guild_id)
+
+
+class _MoonAddModal(discord.ui.Modal, title="Add Moon to Planet"):
+    planet_name = discord.ui.TextInput(label="Planet Name", max_length=40,
+                                       placeholder="e.g. Terra Prime")
+    moon_name   = discord.ui.TextInput(label="Moon Name", max_length=40,
+                                       placeholder="e.g. Selene")
+    moon_desc   = discord.ui.TextInput(label="Description (optional)", max_length=120,
+                                       required=False, placeholder="e.g. Barren rock, used as relay station")
+
+    async def on_submit(self, i: discord.Interaction):
+        pname = str(self.planet_name).strip()
+        mname = str(self.moon_name).strip()
+        desc  = str(self.moon_desc).strip() or None
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            planet = await conn.fetchrow(
+                "SELECT id FROM planets WHERE guild_id=$1 AND LOWER(name)=LOWER($2)",
+                i.guild_id, pname)
+            if not planet:
+                await i.response.send_message(f"Planet `{pname}` not found.", ephemeral=True); return
+            existing = await conn.fetchval(
+                "SELECT COUNT(*) FROM planet_moons WHERE guild_id=$1 AND planet_id=$2",
+                i.guild_id, planet["id"])
+            if existing >= 6:
+                await i.response.send_message("A planet can have at most 6 moons.", ephemeral=True); return
+            await conn.execute(
+                "INSERT INTO planet_moons (guild_id, planet_id, name, description) "
+                "VALUES ($1,$2,$3,$4) ON CONFLICT (guild_id, planet_id, name) DO UPDATE "
+                "SET description=EXCLUDED.description",
+                i.guild_id, planet["id"], mname, desc)
+        await i.response.send_message(
+            f"🌙 Moon **{mname}** added to **{pname}**.", ephemeral=True)
+        await _refresh_public_surfaces(i.client, i.guild_id)
+
+
+class _MoonRemoveModal(discord.ui.Modal, title="Remove Moon"):
+    planet_name = discord.ui.TextInput(label="Planet Name", max_length=40,
+                                       placeholder="e.g. Terra Prime")
+    moon_name   = discord.ui.TextInput(label="Moon Name to Remove", max_length=40,
+                                       placeholder="e.g. Selene")
+
+    async def on_submit(self, i: discord.Interaction):
+        pname = str(self.planet_name).strip()
+        mname = str(self.moon_name).strip()
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            planet = await conn.fetchrow(
+                "SELECT id FROM planets WHERE guild_id=$1 AND LOWER(name)=LOWER($2)",
+                i.guild_id, pname)
+            if not planet:
+                await i.response.send_message(f"Planet `{pname}` not found.", ephemeral=True); return
+            deleted = await conn.execute(
+                "DELETE FROM planet_moons WHERE guild_id=$1 AND planet_id=$2 AND LOWER(name)=LOWER($3)",
+                i.guild_id, planet["id"], mname)
+            if deleted == "DELETE 0":
+                await i.response.send_message(
+                    f"Moon `{mname}` not found on **{pname}**.", ephemeral=True); return
+        await i.response.send_message(
+            f"🌙 Moon **{mname}** removed from **{pname}**.", ephemeral=True)
         await _refresh_public_surfaces(i.client, i.guild_id)
 
 
