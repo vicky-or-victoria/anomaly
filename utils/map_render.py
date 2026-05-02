@@ -982,35 +982,27 @@ def _draw_overview_node(draw, x, y, planet, is_active, fonts):
     has_contract = bool(_overview_value(planet, "has_active_contract", False))
     r = 16 if is_active else (13 if has_contract else 10)
 
-    if is_active:
-        # Main Base planet: normal-looking planet (dark fill, blue-grey outline)
-        # The moon carries the special ring treatment instead of the planet
-        draw.ellipse((x - r, y - r, x + r, y + r),
-                     fill=(28, 34, 44), outline=(140, 160, 190), width=2)
-        # Single subtle ring to mark as home base
-        draw.ellipse((x - r - 5, y - r - 5, x + r + 5, y + r + 5),
-                     outline=(80, 100, 130), width=1)
-    elif has_contract:
-        # Has an active contract but is not the admin-selected active planet
-        # Show with a warm amber/gold pulse ring to indicate "war ongoing here"
+    if has_contract:
+        # Engaged: warm amber/gold pulse ring
         for grow, lum in [(14, 28), (8, 55)]:
             draw.ellipse((x - r - grow, y - r - grow, x + r + grow, y + r + grow),
                          outline=(lum + 20, lum, 0), width=1)
         draw.ellipse((x - r, y - r, x + r, y + r),
                      fill=(60, 44, 12), outline=(200, 148, 30), width=2)
     else:
+        # Standby: plain dark planet
         draw.ellipse((x - r, y - r, x + r, y + r),
                      fill=(8, 8, 9), outline=(112, 112, 112), width=2)
 
-    tick = 7 if is_active else 5
-    col  = (180, 180, 180) if is_active else ((180, 140, 30) if has_contract else (78, 78, 78))
+    tick = 5
+    col  = (180, 140, 30) if has_contract else (78, 78, 78)
     draw.line((x - r - tick, y,   x - r - 2, y),   fill=col, width=1)
     draw.line((x + r + 2,    y,   x + r + tick, y), fill=col, width=1)
     draw.line((x, y - r - tick,   x, y - r - 2),    fill=col, width=1)
     draw.line((x, y + r + 2,      x, y + r + tick), fill=col, width=1)
 
     name      = _overview_value(planet, "name", "Unknown")
-    label_col = (224, 224, 224) if is_active else ((210, 165, 40) if has_contract else (126, 126, 126))
+    label_col = (210, 165, 40) if has_contract else (126, 126, 126)
     _overview_text(draw, (x + r + 11, y - 10), name, fonts["body"], label_col, max_width=150)
 
     n_contracts = int(_overview_value(planet, "contract_count", 0))
