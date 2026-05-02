@@ -409,6 +409,18 @@ class AdminPanelView(discord.ui.View):
             msg = "\u274c Force turn failed: " + str(e) + "\n```\n" + tb + "\n```"
             await i.followup.send(msg, ephemeral=True)
 
+    async def add_fleets(self, i: discord.Interaction, b: discord.ui.Button = None):
+        """Add fleets to the global pool."""
+        if not await _is_admin(self.bot, i):
+            await i.response.send_message("Admins only.", ephemeral=True); return
+        await i.response.send_modal(_AdjustFleetModal(mode="add"))
+
+    async def remove_fleets(self, i: discord.Interaction, b: discord.ui.Button = None):
+        """Remove fleets from the global pool."""
+        if not await _is_admin(self.bot, i):
+            await i.response.send_message("Admins only.", ephemeral=True); return
+        await i.response.send_modal(_AdjustFleetModal(mode="remove"))
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # GM PANEL
