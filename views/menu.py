@@ -567,7 +567,10 @@ async def _send_contract_board(i: discord.Interaction):
     embed.description = "\n\n".join(lines)
     embed.set_footer(text=f"{bot_name}  ·  {len(rows)} active contract(s)")
 
-    await i.response.send_message(embed=embed, ephemeral=True)
+    await i.response.send_message(
+        embed=embed,
+        view=ContractBoardView(i.guild_id, rows),
+        ephemeral=True)
 
 
 # ── Per-contract action view ───────────────────────────────────────────────────
@@ -653,22 +656,18 @@ class ContractActionView(View):
             await i.response.send_message(
                 f"Contract is **{c['status']}** — deployment opens once the GM assigns fleets.",
                 ephemeral=True); return
+        if c["status"] == "active":
+            await i.response.send_message(
+                "This contract already has an active tactical operation. Late deployments are closed.",
+                ephemeral=True); return
         from cogs.squadron_cog import open_returning_deploy
         await open_returning_deploy(i, self.contract_id)
 
     @discord.ui.button(label="⚔️ Enlist New Unit", style=discord.ButtonStyle.success,   row=1)
     async def new_unit_contract(self, i: discord.Interaction, b: Button):
-        c, accepted = await self._get_contract(i)
-        if c is None: return
-        if not accepted:
-            await i.response.send_message(
-                "Accept this contract first, then enlist once fleets are assigned.",
-                ephemeral=True); return
-        if c["status"] not in DEPLOYABLE_STATUSES:
-            await i.response.send_message(
-                f"Contract is **{c['status']}** — fleets must be assigned before enlisting.",
-                ephemeral=True); return
-        await i.response.send_modal(_UnitNameModal(i.guild_id, False, self.contract_id))
+        await i.response.send_message(
+            "Create roster units from the **Enlist** button. Contract deployment now happens only through **Deploy Roster**.",
+            ephemeral=True)
 
 
 # ── Combat log ────────────────────────────────────────────────────────────────
@@ -1017,10 +1016,9 @@ class EnlistView(View):
     @discord.ui.button(label="⚔️ Enlist",      style=discord.ButtonStyle.success,   custom_id="enlist_board_enlist")
     async def enlist_now(self, i: discord.Interaction, b: Button):
         """
-        Register the player as a commandant in the DB (creates commander_profiles row),
-        then send the contract board so they can accept a contract and create their unit.
+        Register the player as a squad commander. If they do not have a
+        roster unit yet, continue into unit creation without deploying.
         """
-        await i.response.defer(ephemeral=True, thinking=True)
         pool = await get_pool()
         async with pool.acquire() as conn:
             theme = await get_theme(conn, i.guild_id)
@@ -1030,11 +1028,10 @@ class EnlistView(View):
             await ensure_commander_profile(conn, i.guild_id, i.user.id, i.user.display_name)
             await grant_default_banner(conn, i.guild_id, i.user.id)
 
-            planet_id   = await get_active_planet_id(conn, i.guild_id)
             active_sq   = await conn.fetchrow(
                 "SELECT name FROM squadrons "
-                "WHERE guild_id=$1 AND planet_id=$2 AND owner_id=$3 AND is_active=TRUE LIMIT 1",
-                i.guild_id, planet_id, i.user.id)
+                "WHERE guild_id=$1 AND owner_id=$2 AND is_active=TRUE LIMIT 1",
+                i.guild_id, i.user.id)
             rostered_sq = await conn.fetchrow(
                 "SELECT name FROM squadrons "
                 "WHERE guild_id=$1 AND owner_id=$2 ORDER BY id DESC LIMIT 1",
@@ -1054,21 +1051,26 @@ class EnlistView(View):
                     except discord.Forbidden:
                         pass
 
-            rows = await fetch_board_contracts(conn, i.guild_id)
-
         if active_sq:
-            await i.followup.send(
+            await i.response.send_message(
                 f"✅ **{i.user.display_name}**, you are already deployed as **{active_sq['name']}**.\n"
                 "Use **📋 Contract** on the command centre to check your contract status.",
                 ephemeral=True)
             return
 
         if rostered_sq:
-            await i.followup.send(
+            await i.response.send_message(
                 f"✅ **{i.user.display_name}**, your commandant file is on record.\n"
                 f"Your unit **{rostered_sq['name']}** is in reserve — use **🚀 Deploy** to redeploy it.",
                 ephemeral=True)
             return
+
+        await i.response.send_modal(_UnitNameModal(i.guild_id, False, None))
+
+        # Roster creation continues through the modal/select flow. Deployment
+        # is intentionally owned by the Deploy button so accepted contracts
+        # can show the tactical map before final placement.
+        return
 
         confirm_embed = discord.Embed(
             title="⚔️  Commandant Registered",

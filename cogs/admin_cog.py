@@ -161,10 +161,10 @@ class AdminPanelView(discord.ui.View):
             turns     = await conn.fetchval(
                 "SELECT COUNT(*) FROM turn_history WHERE guild_id=$1 AND planet_id=$2",
                 i.guild_id, planet_id) or 0
+            is_active = await has_active_contracts(conn, i.guild_id)
         embed = discord.Embed(
             title=f"{theme.get('bot_name','WARBOT')} — War Status",
             color=theme.get("color", 0xAA2222))
-        is_active = await has_active_contracts(conn, i.guild_id)
         embed.add_field(name="State",    value="🟢 Active" if is_active else "🔴 Paused", inline=True)
         embed.add_field(name="Turn",     value=str(turns), inline=True)
         embed.add_field(name="Interval", value=f"{cfg['turn_interval_hours']}h", inline=True)
