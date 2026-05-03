@@ -637,30 +637,94 @@ class GmPanelView(discord.ui.View):
             theme     = await get_theme(conn, i.guild_id)
             planet_id = await get_active_planet_id(conn, i.guild_id)
             rows      = await conn.fetch(
-                "SELECT id, unit_type, hex_address, attack, defense, hp, is_active "
+                "SELECT id, unit_type, hex_address, "
+                "attack, defense, speed, morale, supply, recon, hp "
                 "FROM enemy_units WHERE guild_id=$1 AND planet_id=$2 AND is_active=TRUE "
                 "ORDER BY id",
                 i.guild_id, planet_id)
-            # Also fetch queued moves
             queued = await conn.fetch(
                 "SELECT enemy_unit_id, target_address FROM enemy_gm_moves "
                 "WHERE guild_id=$1 AND planet_id=$2",
                 i.guild_id, planet_id)
-        queued_map = {r["enemy_unit_id"]: r["target_address"] for r in queued}
+            planet = await conn.fetchrow(
+                "SELECT name FROM planets WHERE guild_id=$1 AND id=$2",
+                i.guild_id, planet_id)
+        queued_map  = {r["enemy_unit_id"]: r["target_address"] for r in queued}
+        planet_name = planet["name"] if planet else f"#{planet_id}"
+
         if not rows:
-            await i.response.send_message("No active enemy units.", ephemeral=True); return
+            await i.response.send_message(
+                f"No active enemy units on **{planet_name}**.", ephemeral=True)
+            return
+
         lines = []
         for r in rows:
-            move_str = f" → `{queued_map[r['id']]}`" if r["id"] in queued_map else ""
+            hexes    = max(1, (r["speed"] or 10) // 10)
+            move_tag = f" → `{queued_map[r['id']]}`" if r["id"] in queued_map else ""
             lines.append(
-                f"**ID {r['id']}** `{r['hex_address']}`{move_str} — "
-                f"{r['unit_type']} (ATK:{r['attack']} DEF:{r['defense']} HP:{r['hp'] or 100})"
+                f"**ID {r['id']}** `{r['hex_address']}`{move_tag}\n"
+                f"┣ **{r['unit_type']}** — HP **{r['hp'] or 100}**\n"
+                f"┗ ATK `{r['attack']}` DEF `{r['defense']}` "
+                f"SPD `{r['speed']}` ({hexes}hex/turn) "
+                f"MOR `{r['morale']}` SUP `{r['supply']}` REC `{r['recon']}`"
             )
-        description = "\n".join(lines)
+
+        # Paginate into multiple embeds if needed (4096 char limit per embed)
+        embeds, current, char_count = [], [], 0
+        for line in lines:
+            if char_count + len(line) > 3800 and current:
+                embeds.append("\n\n".join(current))
+                current, char_count = [], 0
+            current.append(line)
+            char_count += len(line)
+        if current:
+            embeds.append("\n\n".join(current))
+
+        color       = theme.get("color", 0xAA2222)
+        first_embed = discord.Embed(
+            title=f"Enemy Units ({len(rows)}) on {planet_name}",
+            description=embeds[0],
+            color=color)
+        first_embed.set_footer(text="→ = queued GM move this turn")
+
+        await i.response.send_message(embed=first_embed, ephemeral=True)
+        for chunk in embeds[1:]:
+            await i.followup.send(
+                embed=discord.Embed(description=chunk, color=color), ephemeral=True)
+
+    async def list_enemy_types(self, i: discord.Interaction, b: discord.ui.Button):
+        """Show all known unit type presets so GMs know what names to spawn."""
+        if not await self._check(i): return
+        from utils.enemy_unit_types import _PRESETS
+
+        lines, seen = [], set()
+        for p in _PRESETS:
+            lbl = p["label"]
+            if lbl in seen:
+                continue
+            seen.add(lbl)
+            b_    = p["base"]
+            hexes = max(1, b_["speed"] // 10)
+            lo, hi = p["variance"]
+            kws   = ", ".join(f"`{k}`" for k in p["keywords"][:4])
+            lines.append(
+                f"**{lbl}** — keywords: {kws}\n"
+                f"┗ ATK `{b_['attack']}` DEF `{b_['defense']}` "
+                f"SPD `{b_['speed']}` ({hexes}hex/turn) "
+                f"MOR `{b_['morale']}` SUP `{b_['supply']}` REC `{b_['recon']}` "
+                f"*(variance {lo:+d}/{hi:+d})*"
+            )
+        lines.append(
+            "\n**Unknown type** — *(any name not matching above)*\n"
+            "┗ All stats `10`, wide variance `−8/+15` — unpredictable"
+        )
+
         embed = discord.Embed(
-            title=f"Enemy Units ({len(rows)}) — queued moves shown as →",
-            color=theme.get("color", 0xAA2222),
-            description=description[:4000])
+            title="Enemy Unit Type Presets",
+            description="\n\n".join(lines)[:4000],
+            color=0x5865F2)
+        embed.set_footer(
+            text="Spawn overrides: add  spd=25 atk=18  in the Spawn modal to pin specific stats")
         await i.response.send_message(embed=embed, ephemeral=True)
 
     # ──── Row 2: Misc ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -937,12 +1001,13 @@ class GmPanelPagerView(_PagedPanelView):
                 "title": "GM Panel / Enemies",
                 "description": "Spawn, move, list, and remove hostile units.",
                 "items": [
-                    {"label": "Spawn Enemy", "method": "spawn_enemy", "style": discord.ButtonStyle.danger},
-                    {"label": "Bulk Spawn", "method": "bulk_spawn_enemy", "style": discord.ButtonStyle.danger},
-                    {"label": "Move Enemy", "method": "move_enemy", "style": discord.ButtonStyle.primary},
-                    {"label": "Bulk Move", "method": "bulk_move_enemy", "style": discord.ButtonStyle.primary},
-                    {"label": "List Enemies", "method": "list_enemies"},
-                    {"label": "Remove Enemy", "method": "remove_enemy", "style": discord.ButtonStyle.danger},
+                    {"label": "Spawn Enemy",      "method": "spawn_enemy",       "style": discord.ButtonStyle.danger},
+                    {"label": "Bulk Spawn",        "method": "bulk_spawn_enemy",  "style": discord.ButtonStyle.danger},
+                    {"label": "Move Enemy",        "method": "move_enemy",        "style": discord.ButtonStyle.primary},
+                    {"label": "Bulk Move",         "method": "bulk_move_enemy",   "style": discord.ButtonStyle.primary},
+                    {"label": "📋 List Enemies",   "method": "list_enemies"},
+                    {"label": "📖 List Types",     "method": "list_enemy_types",  "style": discord.ButtonStyle.primary},
+                    {"label": "Remove Enemy",      "method": "remove_enemy",      "style": discord.ButtonStyle.danger},
                 ],
             },
             {
@@ -2592,9 +2657,9 @@ class _AutoSpawnConfigModal(discord.ui.Modal, title="Configure Auto-Spawn AI"):
         required=False,
     )
     type_input = discord.ui.TextInput(
-        label="Unit type label",
-        placeholder="e.g. Scout, Raider, Drone",
-        max_length=40,
+        label="Unit type(s) — comma-separated for variety",
+        placeholder="Scout, Cavalry, Heavy  (blank = random from all presets)",
+        max_length=120,
         required=False,
     )
     hp_input = discord.ui.TextInput(
@@ -2625,7 +2690,11 @@ class _AutoSpawnConfigModal(discord.ui.Modal, title="Configure Auto-Spawn AI"):
         except ValueError:
             count = 1
 
-        unit_type = str(self.type_input).strip()[:40] or "Enemy"
+        unit_type = str(self.type_input).strip()[:120] or ""
+
+        # Normalise: store as comma-separated, blank = "random" sentinel
+        if not unit_type:
+            unit_type = "random"
 
         try:
             hp = max(1, int(str(self.hp_input).strip())) if str(self.hp_input).strip() else 100
@@ -2647,9 +2716,11 @@ class _AutoSpawnConfigModal(discord.ui.Modal, title="Configure Auto-Spawn AI"):
             """, i.guild_id, self._planet_id, enabled, count, unit_type, hp)
 
         status = "✅ **ENABLED**" if enabled else "⛔ **DISABLED**"
+        type_display = "all preset types (random)" if unit_type == "random" else unit_type
         await i.response.send_message(
             f"🤖 Auto-Spawn AI {status} on **{self._planet_name}**\n"
-            f"• **{count}** `{unit_type}` unit(s) per turn — **{hp} HP** each\n"
+            f"• **{count}** unit(s) per turn — **{hp} HP** each\n"
+            f"• Types: `{type_display}`\n"
             f"• Spawn location: outer edge of the map (random ring hexes)",
             ephemeral=True)
 

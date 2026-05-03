@@ -529,34 +529,40 @@ class TurnEngine:
         auto_ai     = cfg["auto_ai_enabled"]    if cfg else False
 
         if auto_spawn:
-            from utils.enemy_unit_types import generate_stats as _gen_stats
+            from utils.enemy_unit_types import generate_stats as _gen_stats, _PRESETS
+
             spawn_count = max(1, min(20, cfg["auto_spawn_count"] or 1))
-            spawn_type  = (cfg["auto_spawn_type"] or "Enemy")[:40]
+            spawn_type  = (cfg["auto_spawn_type"] or "random").strip()
             spawn_hp    = max(1, cfg["auto_spawn_hp"] or 100)
 
-            outer_ring  = outermost_hexes()
-            # Filter out hexes already occupied by enemy units
-            occupied = {r["hex_address"] for r in await conn.fetch(
+            # Build type pool — "random" = all known preset labels,
+            # otherwise split on commas and use whatever the GM entered.
+            _all_labels = list({p["label"] for p in _PRESETS})
+            if spawn_type.lower() == "random":
+                type_pool = _all_labels
+            else:
+                type_pool = [t.strip() for t in spawn_type.split(",") if t.strip()] or _all_labels
+
+            outer_ring = outermost_hexes()
+            occupied   = {r["hex_address"] for r in await conn.fetch(
                 "SELECT hex_address FROM enemy_units "
                 "WHERE guild_id=$1 AND planet_id=$2 AND is_active=TRUE",
                 guild_id, planet_id)}
-            candidates = [h for h in outer_ring if h not in occupied]
-            if not candidates:
-                candidates = outer_ring  # fall back if all edge hexes occupied
-
+            candidates = [h for h in outer_ring if h not in occupied] or outer_ring
             chosen_hexes = random.sample(candidates, min(spawn_count, len(candidates)))
 
             for hex_addr in chosen_hexes:
-                stats = _gen_stats(spawn_type)
+                chosen_type = random.choice(type_pool)
+                stats = _gen_stats(chosen_type)
                 await conn.execute(
                     "INSERT INTO enemy_units "
                     "(guild_id, planet_id, unit_type, hex_address, "
                     " attack, defense, speed, morale, supply, recon, hp) "
                     "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
-                    guild_id, planet_id, spawn_type, hex_addr,
+                    guild_id, planet_id, chosen_type, hex_addr,
                     *stats.as_tuple(), spawn_hp)
                 summaries.append(
-                    f"🤖 **{spawn_type}** auto-spawned at `{hex_addr}` "
+                    f"🤖 **{chosen_type}** auto-spawned at `{hex_addr}` "
                     f"({spawn_hp} HP, SPD {stats.speed}).")
 
         # ── Step 2: Auto-AI movement (if enabled) ─────────────────────────────
