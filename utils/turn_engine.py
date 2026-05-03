@@ -32,7 +32,7 @@ from utils.brigades import (
 from utils.hexmap import (
     GRID_COORDS, GRID_SET,
     hex_key, parse_hex, hex_neighbors, hex_distance, is_valid,
-    hex_ring_keys, nearest_hex, step_toward,
+    hex_ring_keys, nearest_hex, step_toward, steps_toward,
     outermost_hexes, recompute_statuses,
     STATUS_PLAYER, STATUS_ENEMY,
 )
@@ -529,6 +529,7 @@ class TurnEngine:
         auto_ai     = cfg["auto_ai_enabled"]    if cfg else False
 
         if auto_spawn:
+            from utils.enemy_unit_types import generate_stats as _gen_stats
             spawn_count = max(1, min(20, cfg["auto_spawn_count"] or 1))
             spawn_type  = (cfg["auto_spawn_type"] or "Enemy")[:40]
             spawn_hp    = max(1, cfg["auto_spawn_hp"] or 100)
@@ -545,21 +546,18 @@ class TurnEngine:
 
             chosen_hexes = random.sample(candidates, min(spawn_count, len(candidates)))
 
-            def _rv():
-                return random.randint(-2, 2)
-
             for hex_addr in chosen_hexes:
+                stats = _gen_stats(spawn_type)
                 await conn.execute(
                     "INSERT INTO enemy_units "
                     "(guild_id, planet_id, unit_type, hex_address, "
                     " attack, defense, speed, morale, supply, recon, hp) "
                     "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
                     guild_id, planet_id, spawn_type, hex_addr,
-                    10 + _rv(), 10 + _rv(), 10 + _rv(),
-                    10 + _rv(), 10 + _rv(), 10 + _rv(), spawn_hp)
+                    *stats.as_tuple(), spawn_hp)
                 summaries.append(
                     f"🤖 **{spawn_type}** auto-spawned at `{hex_addr}` "
-                    f"({spawn_hp} HP).")
+                    f"({spawn_hp} HP, SPD {stats.speed}).")
 
         # ── Step 2: Auto-AI movement (if enabled) ─────────────────────────────
         # When auto_ai_enabled is FALSE, enemy units remain stationary unless
@@ -568,7 +566,7 @@ class TurnEngine:
             return  # AI movement disabled — skip entirely
 
         units = await conn.fetch(
-            "SELECT id, hex_address FROM enemy_units "
+            "SELECT id, hex_address, speed FROM enemy_units "
             "WHERE guild_id=$1 AND planet_id=$2 AND is_active=TRUE AND manually_moved=FALSE",
             guild_id, planet_id)
         p_hexes = [r["hex_address"] for r in await conn.fetch(
@@ -578,19 +576,26 @@ class TurnEngine:
 
         for unit in units:
             addr  = unit["hex_address"]
-            nbrs  = hex_neighbors(addr)
-            if not nbrs:
+            speed = unit["speed"] or 10
+
+            # Convert speed stat → hexes moved per turn.
+            # speed 1-9  → 1 hex  (slow/damaged units)
+            # speed 10-19 → 1 hex (standard infantry baseline)
+            # speed 20-29 → 2 hexes (fast units, cavalry equivalent)
+            # speed 30+   → 3 hexes (elite fast movers)
+            move_range = max(1, speed // 10)
+
+            if not hex_neighbors(addr):
                 continue
-            if p_hexes:
-                target_p = nearest_hex(addr, p_hexes)
-                target   = step_toward(addr, target_p)
-            else:
-                target = step_toward(addr, "0,0")
-            if target != addr:
-                movement_arrows.append((addr, target, "enemy"))
+
+            target_p = nearest_hex(addr, p_hexes) if p_hexes else "0,0"
+            dest     = steps_toward(addr, target_p, move_range)
+
+            if dest != addr:
+                movement_arrows.append((addr, dest, "enemy"))
                 await conn.execute(
                     "UPDATE enemy_units SET hex_address=$1 WHERE id=$2",
-                    target, unit["id"])
+                    dest, unit["id"])
 
     # ── Combat ────────────────────────────────────────────────────────────────
 

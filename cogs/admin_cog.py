@@ -2312,25 +2312,63 @@ class _AdjustFleetModal(discord.ui.Modal):
 
 
 class _SpawnEnemyModal(discord.ui.Modal, title="Spawn Enemy Unit"):
-    unit_type   = discord.ui.TextInput(label="Unit Type", placeholder="e.g. Scout", max_length=40)
-    hex_address = discord.ui.TextInput(label="Hex Address", placeholder="e.g. 6,-3", max_length=12)
-    hp_input    = discord.ui.TextInput(
+    unit_type    = discord.ui.TextInput(
+        label="Unit Type", placeholder="e.g. Scout, Cavalry, Heavy, Elite…", max_length=40)
+    hex_address  = discord.ui.TextInput(
+        label="Hex Address", placeholder="e.g. 6,-3", max_length=12)
+    hp_input     = discord.ui.TextInput(
         label="HP (default 100)", placeholder="e.g. 100", max_length=5, required=False)
+    stat_override = discord.ui.TextInput(
+        label="Stat overrides (optional)",
+        placeholder="spd=25 atk=18  — overrides preset for listed stats only",
+        max_length=80, required=False)
     planet_input = discord.ui.TextInput(
         label="Planet ID (blank = active planet)", placeholder="e.g. 2", max_length=6, required=False)
 
     async def on_submit(self, i: discord.Interaction):
+        from utils.enemy_unit_types import generate_stats, preset_summary_table, resolve_preset
+
         addr = str(self.hex_address).strip()
         if not is_valid(addr):
             await i.response.send_message(f"Invalid hex `{addr}`.", ephemeral=True); return
+
         try:
             hp = max(1, int(str(self.hp_input).strip())) if str(self.hp_input).strip() else 100
         except ValueError:
             hp = 100
-        v = lambda: random.randint(-2, 2)
+
+        utype = str(self.unit_type).strip()[:40]
+
+        # Parse optional stat overrides: "spd=25 atk=18 def=12 …"
+        overrides: dict[str, int] = {}
+        _key_map = {"atk": "attack", "attack": "attack",
+                    "def": "defense", "defense": "defense",
+                    "spd": "speed",   "speed": "speed",
+                    "mor": "morale",  "morale": "morale",
+                    "sup": "supply",  "supply": "supply",
+                    "rec": "recon",   "recon": "recon"}
+        for token in str(self.stat_override).split():
+            if "=" in token:
+                k, _, v = token.partition("=")
+                mapped = _key_map.get(k.lower().strip())
+                if mapped:
+                    try:
+                        overrides[mapped] = max(1, int(v.strip()))
+                    except ValueError:
+                        pass
+
+        stats = generate_stats(
+            utype,
+            override_attack  = overrides.get("attack"),
+            override_defense = overrides.get("defense"),
+            override_speed   = overrides.get("speed"),
+            override_morale  = overrides.get("morale"),
+            override_supply  = overrides.get("supply"),
+            override_recon   = overrides.get("recon"),
+        )
+
         pool = await get_pool()
         async with pool.acquire() as conn:
-            # Planet resolution: explicit ID > active planet
             pid_raw = str(self.planet_input).strip()
             if pid_raw.isdigit():
                 planet_id = int(pid_raw)
@@ -2350,36 +2388,65 @@ class _SpawnEnemyModal(discord.ui.Modal, title="Spawn Enemy Unit"):
                 "(guild_id, planet_id, unit_type, hex_address, "
                 " attack, defense, speed, morale, supply, recon, hp) "
                 "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
-                i.guild_id, planet_id, str(self.unit_type).strip()[:40], addr,
-                10+v(), 10+v(), 10+v(), 10+v(), 10+v(), 10+v(), hp)
+                i.guild_id, planet_id, utype, addr,
+                *stats.as_tuple(), hp)
             try:
                 from utils.hexmap import recompute_statuses
                 await recompute_statuses(conn, i.guild_id, planet_id)
             except Exception:
                 pass
+
+        preset = resolve_preset(utype)
+        preset_lbl = f" *(preset: {preset['label']})*" if preset else " *(unknown type — random stats)*"
         await i.response.send_message(
-            f"👾 **{str(self.unit_type).strip()}** spawned at `{addr}` with **{hp} HP** on **{planet_name}**.", ephemeral=True)
+            f"👾 **{utype}**{preset_lbl} spawned at `{addr}` with **{hp} HP** on **{planet_name}**.\n"
+            f"`{stats.summary()}`",
+            ephemeral=True)
         await _refresh_public_surfaces(i.client, i.guild_id)
 
 
 class _BulkSpawnEnemyModal(discord.ui.Modal, title="Bulk Spawn Enemy Units"):
     spawns_input = discord.ui.TextInput(
         label="Spawns (one per line: Name hex)",
-        placeholder="Enemy_unit 0,0\nEnemy_unit_2 0,1\nEnemy Scout -2,4",
+        placeholder="Scout 0,0\nCavalry 0,1\nHeavy -2,4",
         style=discord.TextStyle.paragraph,
         max_length=1600,
         required=True,
     )
     hp_input = discord.ui.TextInput(
         label="HP per unit (default 100)", placeholder="e.g. 100", max_length=5, required=False)
+    stat_override = discord.ui.TextInput(
+        label="Stat overrides for ALL units (optional)",
+        placeholder="spd=25 atk=18  — overrides preset for listed stats only",
+        max_length=80, required=False)
     planet_input = discord.ui.TextInput(
         label="Planet ID (blank = active planet)", placeholder="e.g. 2", max_length=6, required=False)
 
     async def on_submit(self, i: discord.Interaction):
+        from utils.enemy_unit_types import generate_stats, resolve_preset
+
         try:
             hp = max(1, int(str(self.hp_input).strip())) if str(self.hp_input).strip() else 100
         except ValueError:
             hp = 100
+
+        # Parse shared stat overrides
+        _key_map = {"atk": "attack", "attack": "attack",
+                    "def": "defense", "defense": "defense",
+                    "spd": "speed",   "speed": "speed",
+                    "mor": "morale",  "morale": "morale",
+                    "sup": "supply",  "supply": "supply",
+                    "rec": "recon",   "recon": "recon"}
+        overrides: dict[str, int] = {}
+        for token in str(self.stat_override).split():
+            if "=" in token:
+                k, _, v = token.partition("=")
+                mapped = _key_map.get(k.lower().strip())
+                if mapped:
+                    try:
+                        overrides[mapped] = max(1, int(v.strip()))
+                    except ValueError:
+                        pass
 
         raw_lines = str(self.spawns_input).strip().splitlines()
         parsed = []
@@ -2412,7 +2479,6 @@ class _BulkSpawnEnemyModal(discord.ui.Modal, title="Bulk Spawn Enemy Units"):
             await i.response.send_message("Bulk spawn is limited to 40 units at a time.", ephemeral=True)
             return
 
-        v = lambda: random.randint(-2, 2)
         pool = await get_pool()
         successes = []
         async with pool.acquire() as conn:
@@ -2431,14 +2497,25 @@ class _BulkSpawnEnemyModal(discord.ui.Modal, title="Bulk Spawn Enemy Units"):
                     i.guild_id, planet_id)
             planet_name = planet["name"] if planet else f"#{planet_id}"
             for unit_name, addr in parsed:
+                stats = generate_stats(
+                    unit_name,
+                    override_attack  = overrides.get("attack"),
+                    override_defense = overrides.get("defense"),
+                    override_speed   = overrides.get("speed"),
+                    override_morale  = overrides.get("morale"),
+                    override_supply  = overrides.get("supply"),
+                    override_recon   = overrides.get("recon"),
+                )
+                preset = resolve_preset(unit_name)
+                tag = f"[{preset['label']}]" if preset else "[rnd]"
                 await conn.execute(
                     "INSERT INTO enemy_units "
                     "(guild_id, planet_id, unit_type, hex_address, "
                     " attack, defense, speed, morale, supply, recon, hp) "
                     "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
                     i.guild_id, planet_id, unit_name, addr,
-                    10+v(), 10+v(), 10+v(), 10+v(), 10+v(), 10+v(), hp)
-                successes.append(f"**{unit_name}** at `{addr}`")
+                    *stats.as_tuple(), hp)
+                successes.append(f"**{unit_name}** {tag} at `{addr}` — SPD {stats.speed}")
             try:
                 from utils.hexmap import recompute_statuses
                 await recompute_statuses(conn, i.guild_id, planet_id)
