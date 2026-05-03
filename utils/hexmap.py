@@ -147,6 +147,23 @@ def step_toward(from_key: str, to_key: str) -> str:
     return best
 
 
+def steps_toward(from_key: str, to_key: str, n: int) -> str:
+    """
+    Walk up to *n* steps from from_key toward to_key, stopping early if
+    from_key == to_key or no closer neighbor exists.
+    Returns the final hex after all steps.
+    """
+    current = from_key
+    for _ in range(n):
+        if current == to_key:
+            break
+        nxt = step_toward(current, to_key)
+        if nxt == current:
+            break
+        current = nxt
+    return current
+
+
 # ── Outermost hexes (for enemy spawns) ────────────────────────────────────────
 
 def outermost_hexes() -> List[str]:
