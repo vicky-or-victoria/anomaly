@@ -9,6 +9,7 @@ from discord.ui import View, Button
 
 from utils.db import get_pool, get_theme, get_active_planet_id, has_active_contracts
 from utils.brigades import BRIGADES
+from utils.progression import default_unit_name, effective_stats, family_name, resolve_veterancy_tier
 
 
 def _bar(val: int, length: int = 12) -> str:
@@ -201,7 +202,7 @@ class MoveModal(discord.ui.Modal, title="Move Unit"):
             if dist == 0:
                 await i.response.send_message("Already at that hex.", ephemeral=True); return
 
-            budget    = sq["speed"] // 2
+            budget    = max(1, effective_stats(sq)["speed"] // 2)
             remaining = max(0, budget - sq["hexes_moved_this_turn"])
             if dist > remaining:
                 await i.response.send_message(
@@ -713,10 +714,9 @@ async def _send_leaderboard(i: discord.Interaction):
         theme     = await get_theme(conn, i.guild_id)
         planet_id = await get_active_planet_id(conn, i.guild_id)
         rows      = await conn.fetch(
-            "SELECT owner_name, name, attack, defense, speed, morale, supply, recon, "
-            "attack+defense+speed+morale+supply+recon AS power "
+            "SELECT * "
             "FROM squadrons WHERE guild_id=$1 AND planet_id=$2 AND is_active=TRUE "
-            "ORDER BY power DESC LIMIT 10",
+            "ORDER BY xp DESC, id DESC LIMIT 10",
             i.guild_id, planet_id)
     if not rows:
         await i.response.send_message("No units enlisted yet.", ephemeral=True); return
@@ -725,10 +725,14 @@ async def _send_leaderboard(i: discord.Interaction):
     lines  = []
     for n, r in enumerate(rows):
         prefix    = medals[n] if n < 3 else f"**{n+1}.**"
-        power_bar = _mini_bar(r["power"], max_val=120, length=8)
+        stats = effective_stats(r)
+        power = sum(stats.values())
+        power_bar = _mini_bar(power, max_val=160, length=8)
+        unit_name = r["unit_name"] if "unit_name" in r.keys() else default_unit_name(r["brigade"])
+        tier = resolve_veterancy_tier(r["xp"] if "xp" in r.keys() else 0)
         lines.append(
-            f"{prefix} **{r['owner_name']}** — {r['name']}\n"
-            f"  `{power_bar}` **{r['power']}** pts"
+            f"{prefix} **{r['owner_name']}** — {unit_name}\n"
+            f"  `{power_bar}` **{power}** pts | {tier} | XP {r['xp'] if 'xp' in r.keys() else 0}"
         )
 
     embed = discord.Embed(
@@ -736,7 +740,7 @@ async def _send_leaderboard(i: discord.Interaction):
         description="\n".join(lines),
         color=theme.get("color", 0xAA2222),
     )
-    embed.set_footer(text=f"Power = ATK+DEF+SPD+MRL+SUP+RCN · {theme.get('bot_name','WARBOT')}")
+    embed.set_footer(text=f"Power uses effective stats after veterancy and evolution | {theme.get('bot_name','WARBOT')}")
     await i.response.send_message(embed=embed, ephemeral=True)
 
 

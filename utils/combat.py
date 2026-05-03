@@ -38,6 +38,9 @@ class CombatUnit:
     artillery_armed: bool = False
     unit_type:       str = ""
     hp:              int = 100
+    attack_roll_bonus:  int = 0
+    defense_roll_bonus: int = 0
+    dig_in_bonus:       int = 4
 
 
 @dataclass
@@ -64,7 +67,7 @@ def _roll_attacker(unit: CombatUnit) -> int:
     morale     = unit.morale // 5
     recon      = unit.recon  // 6
     supply_pen = max(0, (5 - unit.supply) * 2)
-    return max(1, base + bonus + morale + recon - supply_pen)
+    return max(1, base + bonus + morale + recon + unit.attack_roll_bonus - supply_pen)
 
 
 def _roll_defender(unit: CombatUnit) -> int:
@@ -78,8 +81,8 @@ def _roll_defender(unit: CombatUnit) -> int:
     morale     = unit.morale  // 5
     recon      = unit.recon   // 6
     supply_pen = max(0, (5 - unit.supply) * 2)
-    dig_in_bon = 4 if (unit.brigade == "infantry" and unit.is_dug_in) else 0
-    return max(1, base + bonus + morale + recon + dig_in_bon - supply_pen)
+    dig_in_bon = unit.dig_in_bonus if (unit.brigade == "infantry" and unit.is_dug_in) else 0
+    return max(1, base + bonus + morale + recon + dig_in_bon + unit.defense_roll_bonus - supply_pen)
 
 
 def resolve_combat(
@@ -120,7 +123,7 @@ def resolve_combat(
     # The turn engine models player units as the attacker in each exchange.
     # Dug-in infantry still needs to blunt incoming counterfire.
     if attacker.brigade == "infantry" and attacker.is_dug_in:
-        d_roll = max(1, d_roll - 4)
+        d_roll = max(1, d_roll - attacker.dig_in_bonus)
 
     # Armoured damage reduction
     if defender.brigade == "armoured":

@@ -9,6 +9,8 @@ Import this anywhere brigade logic is needed.
 BRIGADES = {
     "aerial": {
         "name":        "Aerial Brigade",
+        "base_unit_name": "Air Assault Squad",
+        "deployed_suffix": "Squad",
         "emoji":       "✈",
         "ascii_icon":  ">>",   # wings / fast mover
         "description": (
@@ -32,6 +34,8 @@ BRIGADES = {
     },
     "armoured": {
         "name":        "Armoured Brigade",
+        "base_unit_name": "Motorized Armoured Squad",
+        "deployed_suffix": "Squad",
         "emoji":       "🛡",
         "ascii_icon":  "⬢",   # tank/armour block
         "description": (
@@ -55,6 +59,8 @@ BRIGADES = {
     },
     "infantry": {
         "name":        "Infantry Brigade",
+        "base_unit_name": "Line Infantry Squad",
+        "deployed_suffix": "Squad",
         "emoji":       "⚔",
         "ascii_icon":  "XX",   # boots on the ground
         "description": (
@@ -77,6 +83,8 @@ BRIGADES = {
     },
     "ranger": {
         "name":        "Ranger Brigade",
+        "base_unit_name": "Ranger Squad",
+        "deployed_suffix": "Squad",
         "emoji":       "🎯",
         "ascii_icon":  "/\\",  # recon / sight triangle
         "description": (
@@ -100,6 +108,8 @@ BRIGADES = {
     },
     "artillery": {
         "name":        "Artillery Brigade",
+        "base_unit_name": "Field Battery",
+        "deployed_suffix": "Battery",
         "emoji":       "💥",
         "ascii_icon":  "✹",   # bang / shell burst
         "description": (
@@ -124,6 +134,8 @@ BRIGADES = {
     },
     "engineering": {
         "name":        "Engineering Brigade",
+        "base_unit_name": "Combat Engineer Squad",
+        "deployed_suffix": "Squad",
         "emoji":       "🔧",
         "ascii_icon":  "⊞",   # plus/wrench / engineer cross
         "description": (
@@ -146,7 +158,9 @@ BRIGADES = {
         ],
     },
     "special_ops": {
-        "name":        "Special Operations",
+        "name":        "Special Operations Brigade",
+        "base_unit_name": "Special Operations Team",
+        "deployed_suffix": "Team",
         "emoji":       "🕵",
         "ascii_icon":  "◇",   # unknown / ghost
         "description": (

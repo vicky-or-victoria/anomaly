@@ -94,6 +94,29 @@ CREATE TABLE IF NOT EXISTS squadrons (
     artillery_armed     BOOLEAN     NOT NULL DEFAULT FALSE,
     hp                  INT         NOT NULL DEFAULT 100,
     hexes_moved_this_turn INT         NOT NULL DEFAULT 0,
+    brigade_family      TEXT        NOT NULL DEFAULT 'Infantry Brigade',
+    unit_name           TEXT        NOT NULL DEFAULT 'Line Infantry Squad',
+    xp                  INT         NOT NULL DEFAULT 0,
+    veterancy_tier      TEXT        NOT NULL DEFAULT 'Green',
+    evolution_stage     INT         NOT NULL DEFAULT 0,
+    evolution_branch    TEXT        DEFAULT NULL,
+    evolution_path      TEXT[]      NOT NULL DEFAULT '{}',
+    combat_record       JSONB       NOT NULL DEFAULT '{
+        "battles_fought": 0,
+        "battles_won": 0,
+        "kills": 0,
+        "defensive_survivals": 0,
+        "attacking_wins": 0,
+        "recon_successes": 0,
+        "armed_attacks": 0,
+        "support_actions": 0,
+        "fortified_actions": 0,
+        "repair_actions": 0,
+        "revealed_target_attacks": 0,
+        "mobile_attack_wins": 0
+    }'::jsonb,
+    unlocked_evolutions TEXT[]      NOT NULL DEFAULT '{}',
+    capstone_unlocked   BOOLEAN     NOT NULL DEFAULT FALSE,
     UNIQUE(guild_id, planet_id, owner_id, name)
 );
 
@@ -334,6 +357,54 @@ CREATE INDEX IF NOT EXISTS idx_arrows_gp ON movement_arrows(guild_id, planet_id)
 
 -- v5: per-turn hex movement tracking
 DO $$ BEGIN ALTER TABLE squadrons ADD COLUMN IF NOT EXISTS hexes_moved_this_turn INT NOT NULL DEFAULT 0; END $$;
+
+-- v11: Player unit progression, veterancy, and family-locked evolution
+DO $$ BEGIN ALTER TABLE squadrons ADD COLUMN IF NOT EXISTS brigade_family      TEXT    NOT NULL DEFAULT 'Infantry Brigade'; END $$;
+DO $$ BEGIN ALTER TABLE squadrons ADD COLUMN IF NOT EXISTS unit_name           TEXT    NOT NULL DEFAULT 'Line Infantry Squad'; END $$;
+DO $$ BEGIN ALTER TABLE squadrons ADD COLUMN IF NOT EXISTS xp                  INT     NOT NULL DEFAULT 0; END $$;
+DO $$ BEGIN ALTER TABLE squadrons ADD COLUMN IF NOT EXISTS veterancy_tier      TEXT    NOT NULL DEFAULT 'Green'; END $$;
+DO $$ BEGIN ALTER TABLE squadrons ADD COLUMN IF NOT EXISTS evolution_stage     INT     NOT NULL DEFAULT 0; END $$;
+DO $$ BEGIN ALTER TABLE squadrons ADD COLUMN IF NOT EXISTS evolution_branch    TEXT    DEFAULT NULL; END $$;
+DO $$ BEGIN ALTER TABLE squadrons ADD COLUMN IF NOT EXISTS evolution_path      TEXT[]  NOT NULL DEFAULT '{}'; END $$;
+DO $$ BEGIN ALTER TABLE squadrons ADD COLUMN IF NOT EXISTS combat_record       JSONB   NOT NULL DEFAULT '{
+    "battles_fought": 0,
+    "battles_won": 0,
+    "kills": 0,
+    "defensive_survivals": 0,
+    "attacking_wins": 0,
+    "recon_successes": 0,
+    "armed_attacks": 0,
+    "support_actions": 0,
+    "fortified_actions": 0,
+    "repair_actions": 0,
+    "revealed_target_attacks": 0,
+    "mobile_attack_wins": 0
+}'::jsonb; END $$;
+DO $$ BEGIN ALTER TABLE squadrons ADD COLUMN IF NOT EXISTS unlocked_evolutions TEXT[]  NOT NULL DEFAULT '{}'; END $$;
+DO $$ BEGIN ALTER TABLE squadrons ADD COLUMN IF NOT EXISTS capstone_unlocked   BOOLEAN NOT NULL DEFAULT FALSE; END $$;
+
+DO $$ BEGIN
+    UPDATE squadrons
+    SET brigade_family = CASE brigade
+        WHEN 'armoured' THEN 'Armoured Brigade'
+        WHEN 'aerial' THEN 'Aerial Brigade'
+        WHEN 'ranger' THEN 'Ranger Brigade'
+        WHEN 'artillery' THEN 'Artillery Brigade'
+        WHEN 'engineering' THEN 'Engineering Brigade'
+        WHEN 'special_ops' THEN 'Special Operations Brigade'
+        ELSE 'Infantry Brigade'
+    END,
+    unit_name = CASE brigade
+        WHEN 'armoured' THEN 'Motorized Armoured Squad'
+        WHEN 'aerial' THEN 'Air Assault Squad'
+        WHEN 'ranger' THEN 'Ranger Squad'
+        WHEN 'artillery' THEN 'Field Battery'
+        WHEN 'engineering' THEN 'Combat Engineer Squad'
+        WHEN 'special_ops' THEN 'Special Operations Team'
+        ELSE 'Line Infantry Squad'
+    END
+    WHERE unit_name IS NULL OR unit_name = 'Line Infantry Squad';
+END $$;
 
 -- Migration guard for existing databases
 DO $$ BEGIN

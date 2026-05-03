@@ -29,6 +29,14 @@ from utils.brigades import (
     transit_turns as brigade_transit, supply_drain as brigade_drain,
     move_steps as brigade_steps, can_direct_insert,
 )
+from utils.progression import (
+    attack_roll_bonus,
+    award_combat_progress,
+    defense_roll_bonus,
+    dig_in_bonus,
+    effective_stats,
+    splash_damage,
+)
 from utils.hexmap import (
     GRID_COORDS, GRID_SET,
     hex_key, parse_hex, hex_neighbors, hex_distance, is_valid,
@@ -608,9 +616,7 @@ class TurnEngine:
     async def _combat(self, conn, guild_id, planet_id, turn_num,
                        summaries, theme, enemy_type, movement_arrows):
         p_rows = await conn.fetch(
-            "SELECT id, hex_address, owner_id, owner_name, name, brigade, "
-            "attack, defense, speed, morale, supply, recon, is_dug_in, artillery_armed, hp "
-            "FROM squadrons "
+            "SELECT * FROM squadrons "
             "WHERE guild_id=$1 AND planet_id=$2 AND is_active=TRUE AND in_transit=FALSE",
             guild_id, planet_id)
         e_rows = await conn.fetch(
@@ -635,9 +641,10 @@ class TurnEngine:
         for hex_addr in contested:
             p_units = p_by_hex[hex_addr]
             e_units = e_by_hex[hex_addr]
+            eff_by_id = {u["id"]: effective_stats(u) for u in p_units}
 
             def avg(stat):
-                return sum(u[stat] for u in p_units) // len(p_units)
+                return sum(eff_by_id[u["id"]][stat] for u in p_units) // len(p_units)
 
             # Representative brigade — use the first unit's brigade
             rep_brigade = p_units[0]["brigade"] if p_units else "infantry"
@@ -652,7 +659,7 @@ class TurnEngine:
             avg_player_hp = sum(p_hp_map.values()) // max(1, len(p_hp_map))
 
             player_cu = CombatUnit(
-                name=f"{pl} ({', '.join(u['name'] for u in p_units)})",
+                name=f"{pl} ({', '.join(u['unit_name'] for u in p_units)})",
                 side="players",
                 attack=avg("attack"), defense=avg("defense"), speed=avg("speed"),
                 morale=avg("morale"), supply=avg("supply"),  recon=avg("recon"),
@@ -660,6 +667,9 @@ class TurnEngine:
                 is_dug_in=any(u["is_dug_in"] for u in p_units),
                 artillery_armed=any(u["artillery_armed"] for u in p_units),
                 hp=avg_player_hp,
+                attack_roll_bonus=max(attack_roll_bonus(u, turn_num) for u in p_units),
+                defense_roll_bonus=max(defense_roll_bonus(u) for u in p_units),
+                dig_in_bonus=max(dig_in_bonus(u) for u in p_units),
             )
 
             fatigue       = 0
@@ -703,7 +713,14 @@ class TurnEngine:
                     is_dug_in=player_cu.is_dug_in,
                     artillery_armed=player_cu.artillery_armed,
                     hp=avg_player_hp,
+                    attack_roll_bonus=player_cu.attack_roll_bonus,
+                    defense_roll_bonus=player_cu.defense_roll_bonus,
+                    dig_in_bonus=player_cu.dig_in_bonus,
                 )
+                combat_participants = [
+                    pu for pu in p_units if p_hp_map.get(pu["id"], 0) > 0
+                ]
+                damage_taken_by_unit = {pu["id"]: 0 for pu in combat_participants}
                 result = resolve_combat(
                     tired, enemy_cu,
                     attacker_hex=hex_addr,
@@ -718,6 +735,8 @@ class TurnEngine:
                     result.attacker, result.defender,
                     result.attacker_roll, result.defender_roll, result.outcome)
                 summaries.append(f"⚔ **{hex_addr}**: {result.narrative}")
+                new_enemy_hp = cur_enemy_hp
+                stop_after_award = False
 
                 # ── Apply HP damage to enemy ──────────────────────────────────
                 if result.defender_damage > 0:
@@ -745,6 +764,9 @@ class TurnEngine:
                         assigned_damage = base_damage + (1 if idx < remainder else 0)
                         if assigned_damage <= 0:
                             continue
+                        damage_taken_by_unit[pu["id"]] = (
+                            damage_taken_by_unit.get(pu["id"], 0) + assigned_damage
+                        )
                         cur_hp = p_hp_map[pu["id"]]
                         new_hp = max(0, cur_hp - assigned_damage)
                         p_hp_map[pu["id"]] = new_hp
@@ -804,20 +826,21 @@ class TurnEngine:
                     fatigue   += 1
                     if (result.defender_roll - result.attacker_roll) >= 10:
                         player_routed = True
-                        break
+                        stop_after_award = True
                 else:
                     final_ctrl = "neutral"
                     fatigue   += 1
 
-                # Artillery splash damage — deal fixed 10 HP to splashed enemy units
+                # Artillery splash damage scales with artillery veterancy.
                 if result.splash_hexes:
+                    splash_amount = max(splash_damage(pu) for pu in p_units)
                     for sh in result.splash_hexes:
                         splash_rows = await conn.fetch(
                             "SELECT id, unit_type, hp FROM enemy_units "
                             "WHERE guild_id=$1 AND planet_id=$2 AND hex_address=$3 AND is_active=TRUE",
                             guild_id, planet_id, sh)
                         for sr in splash_rows:
-                            splash_new_hp = max(0, (sr["hp"] or 100) - 10)
+                            splash_new_hp = max(0, (sr["hp"] or 100) - splash_amount)
                             if splash_new_hp <= 0:
                                 await conn.execute(
                                     "UPDATE enemy_units SET hp=0, is_active=FALSE WHERE id=$1",
@@ -831,6 +854,43 @@ class TurnEngine:
                                 summaries.append(
                                     f"💥 Artillery splash hit **{el} [{sr['unit_type']}]** at `{sh}` "
                                     f"(`{splash_new_hp} HP` remaining).")
+
+                # XP is awarded after HP changes so low-HP survivals and kills
+                # reflect the real result of this exchange.
+                enemy_power = sum(e[k] for k in ("attack", "defense", "speed", "morale", "supply", "recon"))
+                for pu in combat_participants:
+                    pu_stats = eff_by_id[pu["id"]]
+                    current_hp = p_hp_map.get(pu["id"], 0)
+                    xp_info = await award_combat_progress(
+                        conn,
+                        pu["id"],
+                        result,
+                        {
+                            "turn_number": turn_num,
+                            "destroyed_enemy": new_enemy_hp <= 0,
+                            "survived_low_hp": 0 < current_hp < 40,
+                            "unit_destroyed": current_hp <= 0,
+                            "stronger_enemy": enemy_power > sum(pu_stats.values()),
+                            "damage_taken": damage_taken_by_unit.get(pu["id"], 0),
+                            "splash_hits": len(result.splash_hexes),
+                            "adjacent_friendly": len(p_units) > 1,
+                        },
+                    )
+                    if xp_info.get("xp", 0) > 0:
+                        summaries.append(
+                            f"XP **+{xp_info['xp']}** -> **{pu['owner_name']}'s {pu['unit_name']}** "
+                            f"({xp_info['tier']}).")
+                    if xp_info.get("tier_changed"):
+                        summaries.append(
+                            f"VETERANCY: **{pu['owner_name']}'s {pu['unit_name']}** advanced to "
+                            f"**{xp_info['tier']}**.")
+                    if xp_info.get("unlocked"):
+                        summaries.append(
+                            f"EVOLUTION READY: **{pu['unit_name']}** can refine into "
+                            f"{', '.join(xp_info['unlocked'])}.")
+
+                if stop_after_award:
+                    break
 
             await conn.execute(
                 "UPDATE hexes SET controller=$1, status=$1 "

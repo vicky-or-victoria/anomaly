@@ -7,6 +7,7 @@ Players interact via:
   - MoveDirectionView                    → directional pad (speed-capped per turn)
 """
 
+import json
 import random
 import discord
 from discord import app_commands
@@ -21,6 +22,21 @@ from utils.brigades import (
     BRIGADES, BRIGADE_KEYS, get_brigade, brigade_stats,
     transit_turns, move_steps, can_direct_insert,
     can_scavenge_twice, scavenge_bonus, brigade_choices,
+)
+from utils.progression import (
+    apply_evolution,
+    award_action_progress,
+    default_unit_name,
+    effective_stats,
+    eligible_evolutions,
+    family_name,
+    format_requirements,
+    locked_evolution_brief,
+    next_tier_threshold,
+    parse_record,
+    progression_defaults,
+    resolve_veterancy_tier,
+    total_bonus,
 )
 from utils.profiles import (
     RECOVERY_STATUS,
@@ -41,54 +57,82 @@ def _bar(val: int, length: int = 10, max_val: int = 20) -> str:
 
 async def build_unit_embed(sq, theme: dict, turn_count: int) -> discord.Embed:
     brig = get_brigade(sq["brigade"])
-    hp     = sq["hp"] if "hp" in sq.keys() else 100
+    hp = sq["hp"] if "hp" in sq.keys() else 100
     max_hp = 100
     hp_pct = int(hp / max_hp * 100)
     hp_bar = _bar(hp, max_val=max_hp, length=10)
+    eff = effective_stats(sq)
+    bonuses = total_bonus(sq)
+    xp = sq["xp"] if "xp" in sq.keys() else 0
+    tier = resolve_veterancy_tier(xp)
+    next_xp = next_tier_threshold(xp)
+    family = sq["brigade_family"] if "brigade_family" in sq.keys() else family_name(sq["brigade"])
+    unit_name = sq["unit_name"] if "unit_name" in sq.keys() else default_unit_name(sq["brigade"])
+    stage = sq["evolution_stage"] if "evolution_stage" in sq.keys() else 0
+    branch = sq["evolution_branch"] if "evolution_branch" in sq.keys() else None
+    capstone = bool(sq["capstone_unlocked"]) if "capstone_unlocked" in sq.keys() else False
 
     flags = []
     if sq["in_transit"]:
-        flags.append(f"⚡ IN TRANSIT → `{sq['transit_destination']}` ({sq['transit_turns_left']} turn(s) left)")
+        flags.append(f"IN TRANSIT -> `{sq['transit_destination']}` ({sq['transit_turns_left']} turn(s) left)")
     if sq["is_dug_in"]:
-        flags.append("⛏ Dug In (+4 DEF)")
+        flags.append("DUG IN")
     if sq["artillery_armed"]:
-        flags.append("🎯 Artillery Armed")
-    flag_str = "  ·  ".join(flags) + "\n" if flags else ""
+        flags.append("ARTILLERY ARMED")
+    if capstone:
+        flags.append("LEGENDARY CAPSTONE ONLINE")
+    flag_str = "  |  ".join(flags) + "\n" if flags else ""
 
-    budget        = sq["speed"] // 2
-    move_left     = max(0, budget - sq["hexes_moved_this_turn"]) if "hexes_moved_this_turn" in sq.keys() else budget
-    move_bar      = _bar(move_left, max_val=budget, length=6) if budget > 0 else "------"
-    supply_bar    = _bar(sq["supply"], max_val=20, length=10)
+    budget = max(1, eff["speed"] // 2)
+    move_left = max(0, budget - sq["hexes_moved_this_turn"]) if "hexes_moved_this_turn" in sq.keys() else budget
+    move_bar = _bar(move_left, max_val=budget, length=6) if budget > 0 else "------"
+    supply_bar = _bar(sq["supply"], max_val=20, length=10)
+    xp_bar = _bar(xp, max_val=1600, length=12)
+    bonus_line = " | ".join(
+        f"{k.upper()} +{v}" for k, v in bonuses.items() if v
+    ) or "No active stat package"
 
     embed = discord.Embed(
-        title=f"{brig['emoji']}  {sq['owner_name']} — {sq['name']}",
-        color=theme.get("color", 0xAA2222),
+        title=f"{'★ ' if tier == 'Legendary' else ''}{sq['owner_name']} - {unit_name}",
+        color=0xC9A227 if tier == "Legendary" else theme.get("color", 0xAA2222),
         description=(
-            f"> **{brig['name']}**  ·  `{sq['hex_address']}`  ·  Turn **{turn_count}**"
+            f"> **Family:** {family}\n"
+            f"> **Callsign:** {sq['name']}  |  **Hex:** `{sq['hex_address']}`  |  **Turn:** {turn_count}\n"
+            f"> **Veterancy:** {tier}  |  **XP:** {xp}/{next_xp}  |  **Evolution Stage:** {stage}"
+            + (f"  |  **Branch:** {branch.replace('_', ' ').title()}" if branch else "")
             + (f"\n> {flag_str.strip()}" if flag_str else "")
         ),
     )
     embed.add_field(
-        name=f"HP  {hp_bar}  {hp}/{max_hp}  ({hp_pct}%)",
-        value=f"Supply  {supply_bar}  {sq['supply']}/20  ·  Move budget: {move_left}/{budget}",
+        name=f"Readiness  [{hp_pct}%]",
+        value=(
+            f"HP `{hp_bar}` {hp}/{max_hp}\n"
+            f"Supply `{supply_bar}` {sq['supply']}/20  |  Move `{move_bar}` {move_left}/{budget}\n"
+            f"XP `{xp_bar}` {xp}/1600"
+        ),
         inline=False,
     )
     embed.add_field(
         name="Offence",
-        value=f"ATK `{_bar(sq['attack'])}` {sq['attack']}\nRCN `{_bar(sq['recon'])}` {sq['recon']}",
+        value=f"ATK `{_bar(eff['attack'], max_val=30)}` {eff['attack']}\nRCN `{_bar(eff['recon'], max_val=30)}` {eff['recon']}",
         inline=True,
     )
     embed.add_field(
         name="Defence",
-        value=f"DEF `{_bar(sq['defense'])}` {sq['defense']}\nMRL `{_bar(sq['morale'])}` {sq['morale']}",
+        value=f"DEF `{_bar(eff['defense'], max_val=30)}` {eff['defense']}\nMRL `{_bar(eff['morale'], max_val=30)}` {eff['morale']}",
         inline=True,
     )
     embed.add_field(
         name="Mobility",
-        value=f"SPD `{_bar(sq['speed'])}` {sq['speed']}\nSUP `{supply_bar}` {sq['supply']}",
+        value=f"SPD `{_bar(eff['speed'], max_val=30)}` {eff['speed']}\nSUP `{_bar(eff['supply'], max_val=30)}` {eff['supply']}",
         inline=True,
     )
-    embed.set_footer(text=f"{theme.get('flavor_text', '')}  ·  {brig['name']} Brigade")
+    embed.add_field(
+        name="Active Doctrine Package",
+        value=f"`{bonus_line}`",
+        inline=False,
+    )
+    embed.set_footer(text=f"{theme.get('flavor_text', '')} | {brig['name']} origin")
     return embed
 
 
@@ -120,9 +164,14 @@ class UnitPanelView(discord.ui.View):
         for btn in specials:
             self.add_item(btn)
 
-        # Row 2 — misc
+        # Row 2 - progression and roster controls
+        doctrine_btn = discord.ui.Button(
+            label="Doctrine", style=discord.ButtonStyle.primary, row=2)
+        doctrine_btn.callback = self._doctrine
+        self.add_item(doctrine_btn)
+
         list_btn = discord.ui.Button(
-            label="📋 List Units", style=discord.ButtonStyle.secondary, row=2)
+            label="List Units", style=discord.ButtonStyle.secondary, row=2)
         list_btn.callback = self._list_units
         self.add_item(list_btn)
 
@@ -133,15 +182,14 @@ class UnitPanelView(discord.ui.View):
         async with pool.acquire() as conn:
             planet_id = await get_active_planet_id(conn, self.guild_id)
             sq = await conn.fetchrow(
-                "SELECT hex_address, brigade, in_transit, name, speed, hexes_moved_this_turn "
-                "FROM squadrons "
+                "SELECT * FROM squadrons "
                 "WHERE guild_id=$1 AND planet_id=$2 AND owner_id=$3 AND is_active=TRUE LIMIT 1",
                 self.guild_id, planet_id, interaction.user.id)
             if not sq:
                 await interaction.followup.send("No active unit.", ephemeral=True); return
             if sq["in_transit"]:
                 await interaction.followup.send("Unit is already in transit.", ephemeral=True); return
-            budget    = sq["speed"] // 2
+            budget    = max(1, effective_stats(sq)["speed"] // 2)
             remaining = max(0, budget - sq["hexes_moved_this_turn"])
             if remaining == 0:
                 await interaction.followup.send(
@@ -182,6 +230,9 @@ class UnitPanelView(discord.ui.View):
 
     async def _list_units(self, interaction: discord.Interaction):
         await _do_list_units(interaction, self.guild_id)
+
+    async def _doctrine(self, interaction: discord.Interaction):
+        await _send_doctrine_panel(interaction, self.guild_id)
 
 
 def _brigade_special_buttons(guild_id: int, brigade: str):
@@ -248,7 +299,7 @@ async def send_unit_panel(interaction: discord.Interaction, guild_id: int):
             "SELECT COUNT(*) FROM turn_history WHERE guild_id=$1 AND planet_id=$2",
             guild_id, planet_id) or 0
 
-    budget        = sq["speed"] // 2 if "speed" in sq.keys() else 5
+    budget        = max(1, effective_stats(sq)["speed"] // 2) if "speed" in sq.keys() else 5
     move_exhausted = sq["hexes_moved_this_turn"] >= budget if "hexes_moved_this_turn" in sq.keys() else False
     embed = await build_unit_embed(sq, theme, turn_count)
     view  = UnitPanelView(guild_id, sq["brigade"], sq["in_transit"], move_exhausted=move_exhausted)
@@ -292,11 +343,19 @@ async def _do_scavenge(interaction: discord.Interaction, guild_id: int):
                 "VALUES ($1,$2,-1,$3) ON CONFLICT DO NOTHING",
                 guild_id, planet_id, second_key)
 
-        gain       = random.randint(2, 6) + (sq["recon"] // 5) + scavenge_bonus(sq["brigade"])
+        tier = resolve_veterancy_tier(sq["xp"] if "xp" in sq.keys() else 0)
+        hardened_ranger = sq["brigade"] == "ranger" and tier in ("Hardened", "Veteran", "Elite", "Legendary")
+        gain       = random.randint(2, 6) + (effective_stats(sq)["recon"] // 5) + scavenge_bonus(sq["brigade"])
+        if hardened_ranger:
+            gain += 1
         new_supply = min(20, sq["supply"] + gain)
+        new_morale = sq["morale"]
+        if sq["brigade"] == "ranger" and tier in ("Veteran", "Elite", "Legendary") and sq["last_scavenged_turn"] < turn_count:
+            new_morale = min(20, sq["morale"] + 1)
         await conn.execute(
-            "UPDATE squadrons SET supply=$1, last_scavenged_turn=$2 WHERE id=$3",
-            new_supply, turn_count, sq["id"])
+            "UPDATE squadrons SET supply=$1, morale=$2, last_scavenged_turn=$3 WHERE id=$4",
+            new_supply, new_morale, turn_count, sq["id"])
+        await award_action_progress(conn, sq["id"], "scavenge", turn_count)
     await interaction.response.send_message(
         f"🔍 Scavenged **+{gain}** supply → `{new_supply}/20`.", ephemeral=True)
 
@@ -306,7 +365,7 @@ async def _do_dig_in(interaction: discord.Interaction, guild_id: int):
     async with pool.acquire() as conn:
         planet_id = await get_active_planet_id(conn, guild_id)
         sq = await conn.fetchrow(
-            "SELECT id, name, brigade FROM squadrons "
+            "SELECT * FROM squadrons "
             "WHERE guild_id=$1 AND planet_id=$2 AND owner_id=$3 AND is_active=TRUE LIMIT 1",
             guild_id, planet_id, interaction.user.id)
         if not sq:
@@ -316,7 +375,7 @@ async def _do_dig_in(interaction: discord.Interaction, guild_id: int):
                 "Only Infantry Brigade can dig in.", ephemeral=True); return
         await conn.execute("UPDATE squadrons SET is_dug_in=TRUE WHERE id=$1", sq["id"])
     await interaction.response.send_message(
-        f"⛏ **{sq['name']}** is dug in. +4 defense until next move.", ephemeral=True)
+        f"⛏ **{sq['unit_name']}** is dug in. +{dig_in_bonus(sq)} defense until next move.", ephemeral=True)
 
 
 async def _do_artillery_hold(interaction: discord.Interaction, guild_id: int):
@@ -324,7 +383,7 @@ async def _do_artillery_hold(interaction: discord.Interaction, guild_id: int):
     async with pool.acquire() as conn:
         planet_id = await get_active_planet_id(conn, guild_id)
         sq = await conn.fetchrow(
-            "SELECT id, name, brigade FROM squadrons "
+            "SELECT * FROM squadrons "
             "WHERE guild_id=$1 AND planet_id=$2 AND owner_id=$3 AND is_active=TRUE LIMIT 1",
             guild_id, planet_id, interaction.user.id)
         if not sq:
@@ -334,13 +393,16 @@ async def _do_artillery_hold(interaction: discord.Interaction, guild_id: int):
                 "Only Artillery Brigade can use this.", ephemeral=True); return
         await conn.execute("UPDATE squadrons SET artillery_armed=TRUE WHERE id=$1", sq["id"])
     await interaction.response.send_message(
-        f"🎯 **{sq['name']}** armed and holding — splash damage fires next combat.", ephemeral=True)
+        f"🎯 **{sq['unit_name']}** armed and holding — splash damage fires next combat.", ephemeral=True)
 
 
 async def _do_fortify(interaction: discord.Interaction, guild_id: int):
     pool = await get_pool()
     async with pool.acquire() as conn:
         planet_id = await get_active_planet_id(conn, guild_id)
+        turn_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM turn_history WHERE guild_id=$1 AND planet_id=$2",
+            guild_id, planet_id) or 0
         sq = await conn.fetchrow(
             "SELECT id, name, brigade, hex_address FROM squadrons "
             "WHERE guild_id=$1 AND planet_id=$2 AND owner_id=$3 AND is_active=TRUE LIMIT 1",
@@ -355,6 +417,7 @@ async def _do_fortify(interaction: discord.Interaction, guild_id: int):
             VALUES ($1,$2,$3,'fort')
             ON CONFLICT (guild_id, planet_id, address) DO UPDATE SET terrain='fort'
         """, guild_id, planet_id, sq["hex_address"])
+        await award_action_progress(conn, sq["id"], "fortify", turn_count)
     await interaction.response.send_message(
         f"🏗 Hex `{sq['hex_address']}` has been **fortified** permanently.", ephemeral=True)
 
@@ -363,8 +426,11 @@ async def _do_repair(interaction: discord.Interaction, guild_id: int):
     pool = await get_pool()
     async with pool.acquire() as conn:
         planet_id = await get_active_planet_id(conn, guild_id)
+        turn_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM turn_history WHERE guild_id=$1 AND planet_id=$2",
+            guild_id, planet_id) or 0
         sq = await conn.fetchrow(
-            "SELECT id, name, brigade, hex_address FROM squadrons "
+            "SELECT * FROM squadrons "
             "WHERE guild_id=$1 AND planet_id=$2 AND owner_id=$3 AND is_active=TRUE LIMIT 1",
             guild_id, planet_id, interaction.user.id)
         if not sq:
@@ -378,25 +444,31 @@ async def _do_repair(interaction: discord.Interaction, guild_id: int):
             "WHERE guild_id=$1 AND planet_id=$2 AND is_active=TRUE AND hex_address=ANY($3::text[])",
             guild_id, planet_id, nbrs)
         count = 0
+        tier = resolve_veterancy_tier(sq["xp"] if "xp" in sq.keys() else 0)
+        repair_amount = 6 if tier in ("Veteran", "Elite", "Legendary") else 5 if tier == "Hardened" else 4
         for unit in repaired:
             await conn.execute(
                 "UPDATE squadrons SET supply=$1 WHERE id=$2",
-                min(20, unit["supply"] + 4), unit["id"])
+                min(20, unit["supply"] + repair_amount), unit["id"])
             count += 1
+        await award_action_progress(conn, sq["id"], "repair", turn_count)
     if count == 0:
         await interaction.response.send_message(
             "No friendly units on adjacent hexes to repair.", ephemeral=True)
     else:
         await interaction.response.send_message(
-            f"🔧 Repaired **{count}** adjacent unit(s) (+4 supply each).", ephemeral=True)
+            f"🔧 Repaired **{count}** adjacent unit(s) (+{repair_amount} supply each).", ephemeral=True)
 
 
 async def _do_recon_sweep(interaction: discord.Interaction, guild_id: int):
     pool = await get_pool()
     async with pool.acquire() as conn:
         planet_id = await get_active_planet_id(conn, guild_id)
+        turn_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM turn_history WHERE guild_id=$1 AND planet_id=$2",
+            guild_id, planet_id) or 0
         sq = await conn.fetchrow(
-            "SELECT id, name, brigade, hex_address, recon FROM squadrons "
+            "SELECT * FROM squadrons "
             "WHERE guild_id=$1 AND planet_id=$2 AND owner_id=$3 AND is_active=TRUE LIMIT 1",
             guild_id, planet_id, interaction.user.id)
         if not sq:
@@ -404,7 +476,10 @@ async def _do_recon_sweep(interaction: discord.Interaction, guild_id: int):
         if sq["brigade"] not in ("aerial", "ranger", "special_ops"):
             await interaction.response.send_message(
                 "Only Aerial, Ranger, or Special Ops can perform recon sweeps.", ephemeral=True); return
+        tier = resolve_veterancy_tier(sq["xp"] if "xp" in sq.keys() else 0)
         radius = 3 if sq["brigade"] == "ranger" else 2
+        if sq["brigade"] == "aerial" and tier in ("Veteran", "Elite", "Legendary"):
+            radius += 1
         from utils.hexmap import hexes_within
         nearby_keys = set(hexes_within(sq["hex_address"], radius))
         enemies = await conn.fetch(
@@ -412,6 +487,8 @@ async def _do_recon_sweep(interaction: discord.Interaction, guild_id: int):
             "WHERE guild_id=$1 AND planet_id=$2 AND is_active=TRUE",
             guild_id, planet_id)
         found = [e for e in enemies if e["hex_address"] in nearby_keys]
+        if found:
+            await award_action_progress(conn, sq["id"], "recon", turn_count)
     if not found:
         await interaction.response.send_message(
             f"📡 Recon sweep complete — no contacts within {radius} hexes.", ephemeral=True)
@@ -431,8 +508,7 @@ async def _do_list_units(interaction: discord.Interaction, guild_id: int):
         theme     = await get_theme(conn, guild_id)
         planet_id = await get_active_planet_id(conn, guild_id)
         rows      = await conn.fetch(
-            "SELECT owner_name, name, brigade, hex_address, in_transit, supply "
-            "FROM squadrons "
+            "SELECT * FROM squadrons "
             "WHERE guild_id=$1 AND planet_id=$2 AND is_active=TRUE ORDER BY owner_name",
             guild_id, planet_id)
     if not rows:
@@ -441,9 +517,11 @@ async def _do_list_units(interaction: discord.Interaction, guild_id: int):
     for r in rows:
         brig = get_brigade(r["brigade"])
         t    = " (transit)" if r["in_transit"] else ""
+        unit_name = r["unit_name"] if "unit_name" in r.keys() else default_unit_name(r["brigade"])
+        tier = resolve_veterancy_tier(r["xp"] if "xp" in r.keys() else 0)
         lines.append(
-            f"{brig['emoji']} **{r['owner_name']}** — {r['name']} "
-            f"[{brig['name']}] @ `{r['hex_address']}`{t} SUP:{r['supply']}")
+            f"{brig['emoji']} **{r['owner_name']}** - {unit_name}\n"
+            f"`{brig['name']}` | Callsign **{r['name']}** | {tier} | XP {r['xp'] if 'xp' in r.keys() else 0} | `{r['hex_address']}`{t} | SUP:{r['supply']}")
     embed = discord.Embed(
         title=f"Active Units  ({len(rows)})",
         description="\n".join(lines),
@@ -456,6 +534,121 @@ async def _do_list_units(interaction: discord.Interaction, guild_id: int):
 # ══════════════════════════════════════════════════════════════════════════════
 # BRIGADE PICKER  (triggered from EnlistView)
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _doctrine_embed(sq, theme: dict) -> discord.Embed:
+    record = parse_record(sq["combat_record"] if "combat_record" in sq.keys() else {})
+    available = eligible_evolutions(sq)
+    locked = locked_evolution_brief(sq)
+    xp = sq["xp"] if "xp" in sq.keys() else 0
+    tier = resolve_veterancy_tier(xp)
+    unit_name = sq["unit_name"] if "unit_name" in sq.keys() else default_unit_name(sq["brigade"])
+    family = sq["brigade_family"] if "brigade_family" in sq.keys() else family_name(sq["brigade"])
+
+    embed = discord.Embed(
+        title=f"Doctrine Board - {unit_name}",
+        description=(
+            f"> **Family:** {family}\n"
+            f"> **Veterancy:** {tier}  |  **XP:** {xp}/1600\n"
+            f"> **Evolution Stage:** {sq['evolution_stage'] if 'evolution_stage' in sq.keys() else 0}"
+        ),
+        color=0xC9A227 if tier == "Legendary" else theme.get("color", 0xAA2222),
+    )
+    embed.add_field(
+        name="Combat Record",
+        value=(
+            f"Battles `{record['battles_fought']}` | Wins `{record['battles_won']}` | Kills `{record['kills']}`\n"
+            f"Recon `{record['recon_successes']}` | Armed `{record['armed_attacks']}` | Support `{record['support_actions']}`\n"
+            f"Defensive Survival `{record['defensive_survivals']}` | Mobile Wins `{record['mobile_attack_wins']}`"
+        ),
+        inline=False,
+    )
+    if available:
+        lines = []
+        for evo in available:
+            bonuses = " ".join(f"{k.upper()}+{v}" for k, v in evo["bonuses"].items())
+            lines.append(
+                f"**{evo['name']}**\n"
+                f"`{bonuses or 'PASSIVE'}` | {evo['function']}"
+            )
+        embed.add_field(name="Evolution Ready", value="\n\n".join(lines), inline=False)
+    elif locked:
+        lines = []
+        for evo in locked[:4]:
+            bonuses = " ".join(f"{k.upper()}+{v}" for k, v in evo["bonuses"].items())
+            lines.append(
+                f"**{evo['name']}**\n"
+                f"`{bonuses or 'PASSIVE'}` | {format_requirements(evo, record, xp)}"
+            )
+        embed.add_field(name="Next Evolution Candidates", value="\n\n".join(lines), inline=False)
+    else:
+        embed.add_field(
+            name="Evolution Complete",
+            value="This unit has reached the end of its current specialization path.",
+            inline=False,
+        )
+    embed.set_footer(text="Select an unlocked doctrine below to evolve. XP and veterancy are preserved.")
+    return embed
+
+
+class EvolutionSelect(discord.ui.Select):
+    def __init__(self, guild_id: int, squadron_id: int, evolutions: list):
+        self.guild_id = guild_id
+        self.squadron_id = squadron_id
+        options = [
+            discord.SelectOption(
+                label=evo["name"][:100],
+                value=evo["name"],
+                description=f"{evo['function']} | Stage {evo['stage']}"[:100],
+            )
+            for evo in evolutions[:25]
+        ]
+        super().__init__(placeholder="Authorize evolution path...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            theme = await get_theme(conn, self.guild_id)
+            try:
+                evo = await apply_evolution(conn, self.squadron_id, self.values[0])
+            except ValueError as exc:
+                await interaction.response.send_message(str(exc), ephemeral=True)
+                return
+        bonuses = " ".join(f"{k.upper()}+{v}" for k, v in evo["bonuses"].items())
+        embed = discord.Embed(
+            title=f"Evolution Authorized - {evo['name']}",
+            description=f"> `{bonuses or 'PASSIVE'}`\n> {evo['function']}",
+            color=theme.get("color", 0xAA2222),
+        )
+        embed.set_footer(text="Family retained. XP, veterancy, and combat record preserved.")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class EvolutionView(discord.ui.View):
+    def __init__(self, guild_id: int, squadron_id: int, evolutions: list):
+        super().__init__(timeout=120)
+        if evolutions:
+            self.add_item(EvolutionSelect(guild_id, squadron_id, evolutions))
+
+
+async def _send_doctrine_panel(interaction: discord.Interaction, guild_id: int):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        theme = await get_theme(conn, guild_id)
+        planet_id = await get_active_planet_id(conn, guild_id)
+        sq = await conn.fetchrow(
+            "SELECT * FROM squadrons "
+            "WHERE guild_id=$1 AND planet_id=$2 AND owner_id=$3 AND is_active=TRUE LIMIT 1",
+            guild_id, planet_id, interaction.user.id)
+    if not sq:
+        await interaction.response.send_message("No active unit.", ephemeral=True)
+        return
+    evolutions = eligible_evolutions(sq)
+    await interaction.response.send_message(
+        embed=_doctrine_embed(sq, theme),
+        view=EvolutionView(guild_id, sq["id"], evolutions),
+        ephemeral=True,
+    )
+
 
 def _brigade_stats_line(stats: dict) -> str:
     return (
@@ -483,6 +676,7 @@ def brigade_picker_embed(unit_name: str, returning: bool = False) -> discord.Emb
         embed.add_field(
             name=f"{b['emoji']}  {b['name']}",
             value=(
+                f"Deployed unit: **{b.get('base_unit_name', 'Line Infantry Squad')}**\n"
                 f"{b['description']}\n"
                 f"```{stats}```"
                 f"Transit: **{b['transit_turns']}** turn(s)  ·  Step: **{b['move_steps']}** hex(es)\n"
@@ -604,17 +798,25 @@ class DeployModal(discord.ui.Modal, title="Deploy Your Unit"):
                 conn, self.guild_id, interaction.user.id, interaction.user.display_name)
             await grant_default_banner(conn, self.guild_id, interaction.user.id)
             await clear_recovery(conn, self.guild_id, interaction.user.id)
+            prog = progression_defaults(self.brigade)
             await conn.execute("""
                 INSERT INTO squadrons
                   (guild_id, planet_id, owner_id, owner_name, name, brigade, hex_address,
-                   attack, defense, speed, morale, supply, recon)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                   attack, defense, speed, morale, supply, recon,
+                   brigade_family, unit_name, xp, veterancy_tier, evolution_stage,
+                   evolution_branch, evolution_path, combat_record, unlocked_evolutions, capstone_unlocked)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
+                        $14,$15,$16,$17,$18,$19,$20::text[],$21::jsonb,$22::text[],$23)
             """,
                 self.guild_id, planet_id,
                 interaction.user.id, interaction.user.display_name,
                 self.unit_name, self.brigade, dest,
                 v(stats["attack"]), v(stats["defense"]), v(stats["speed"]),
-                v(stats["morale"]), v(stats["supply"]),  v(stats["recon"]))
+                v(stats["morale"]), v(stats["supply"]),  v(stats["recon"]),
+                prog["brigade_family"], prog["unit_name"], prog["xp"], prog["veterancy_tier"],
+                prog["evolution_stage"], prog["evolution_branch"], prog["evolution_path"],
+                json.dumps(prog["combat_record"]), prog["unlocked_evolutions"],
+                prog["capstone_unlocked"])
 
             new_sq = await conn.fetchrow(
                 "SELECT id FROM squadrons WHERE guild_id=$1 AND owner_id=$2 AND name=$3",
@@ -656,10 +858,12 @@ class DeployModal(discord.ui.Modal, title="Deploy Your Unit"):
 
         brig  = get_brigade(self.brigade)
         power = sum(stats.values())
+        tactical_name = default_unit_name(self.brigade)
         embed = discord.Embed(
-            title=f"✅  Commandant Deployed — {self.unit_name}",
+            title=f"✅  Commandant Deployed — {tactical_name}",
             description=(
-                f"> **{brig['emoji']} {brig['name']}**  ·  Deployed at `{dest}`\n"
+                f"> **Family:** {brig['name']}  ·  **Callsign:** {self.unit_name}\n"
+                f"> **Unit:** {tactical_name}  ·  Deployed at `{dest}`\n"
                 f"> Power rating: **{power}**"
             ),
             color=theme.get("color", 0xAA2222),
@@ -814,10 +1018,12 @@ class ExistingDeployModal(discord.ui.Modal, title="Deploy Existing Unit"):
             pass
 
         brig = get_brigade(sq["brigade"])
+        unit_name = sq["unit_name"] if "unit_name" in sq.keys() else default_unit_name(sq["brigade"])
         embed = discord.Embed(
-            title=f"🚀  Redeployed — {sq['name']}",
+            title=f"🚀  Redeployed — {unit_name}",
             description=(
-                f"> **{brig['emoji']} {brig['name']}**  ·  Hex `{dest}`\n"
+                f"> **Family:** {brig['name']}  ·  **Callsign:** {sq['name']}\n"
+                f"> **Unit:** {unit_name}  ·  Hex `{dest}`\n"
                 f"> Status: combat cohesion restored for the new contract."
             ),
             color=theme.get("color", 0xAA2222),
@@ -832,10 +1038,11 @@ class ReturningUnitSelect(discord.ui.Select):
         for row in rows[:25]:
             brig = get_brigade(row["brigade"])
             hp = row["hp"] or 0
+            unit_name = row["unit_name"] if "unit_name" in row.keys() else default_unit_name(row["brigade"])
             options.append(discord.SelectOption(
-                label=row["name"][:100],
+                label=unit_name[:100],
                 value=str(row["id"]),
-                description=f"{brig['name']} | HP {hp}/100",
+                description=f"{brig['name']} | Callsign {row['name']} | HP {hp}/100"[:100],
             ))
         super().__init__(placeholder="Choose a roster unit to deploy...", options=options)
         self.guild_id = guild_id
@@ -905,7 +1112,7 @@ async def open_returning_deploy(interaction: discord.Interaction, contract_id: i
             return
 
         rows = await conn.fetch(
-            "SELECT id, name, brigade, hp FROM squadrons "
+            "SELECT * FROM squadrons "
             "WHERE guild_id=$1 AND owner_id=$2 AND is_active=FALSE "
             "ORDER BY id DESC",
             interaction.guild_id, interaction.user.id)
@@ -1036,8 +1243,7 @@ class MoveDirectionView(discord.ui.View):
         async with pool.acquire() as conn:
             planet_id = await get_active_planet_id(conn, interaction.guild_id)
             sq = await conn.fetchrow(
-                "SELECT id, name, brigade, hex_address, in_transit, speed, hexes_moved_this_turn "
-                "FROM squadrons "
+                "SELECT * FROM squadrons "
                 "WHERE guild_id=$1 AND planet_id=$2 AND owner_id=$3 AND is_active=TRUE LIMIT 1",
                 interaction.guild_id, planet_id, interaction.user.id)
             if not sq:
@@ -1047,7 +1253,7 @@ class MoveDirectionView(discord.ui.View):
                 await interaction.followup.send("Unit is in transit.", ephemeral=True)
                 return
 
-            budget    = sq["speed"] // 2
+            budget    = max(1, effective_stats(sq)["speed"] // 2)
             remaining = max(0, budget - sq["hexes_moved_this_turn"])
             if remaining <= 0:
                 await interaction.followup.send(
@@ -1211,7 +1417,7 @@ async def _build_commander_file_embed(conn, guild_id: int, user, theme: dict) ->
         "SELECT * FROM commander_profiles WHERE guild_id=$1 AND owner_id=$2",
         guild_id, user.id)
     active = await conn.fetchrow(
-        "SELECT name, brigade, hex_address, hp, supply, morale FROM squadrons "
+        "SELECT * FROM squadrons "
         "WHERE guild_id=$1 AND planet_id=$2 AND owner_id=$3 AND is_active=TRUE LIMIT 1",
         guild_id, planet_id, user.id)
     banner = await conn.fetchrow("""
@@ -1235,8 +1441,11 @@ async def _build_commander_file_embed(conn, guild_id: int, user, theme: dict) ->
     status = profile["recovery_status"] if profile and profile["recovery_status"] else "fit for deployment"
     if active:
         brig = get_brigade(active["brigade"])
+        unit_name = active["unit_name"] if "unit_name" in active.keys() else default_unit_name(active["brigade"])
+        tier = resolve_veterancy_tier(active["xp"] if "xp" in active.keys() else 0)
         status = (
-            f"deployed with **{active['name']}** ({brig['name']}) at `{active['hex_address']}`\n"
+            f"deployed with **{unit_name}** ({brig['name']}) at `{active['hex_address']}`\n"
+            f"Callsign {active['name']} | {tier} | XP {active['xp'] if 'xp' in active.keys() else 0}\n"
             f"HP {active['hp'] or 100}/100 | Supply {active['supply']} | Morale {active['morale']}"
         )
 
