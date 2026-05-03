@@ -634,63 +634,17 @@ class GmPanelView(discord.ui.View):
         if not await self._check(i): return
         pool = await get_pool()
         async with pool.acquire() as conn:
-            theme     = await get_theme(conn, i.guild_id)
-            planet_id = await get_active_planet_id(conn, i.guild_id)
-            rows      = await conn.fetch(
-                "SELECT id, unit_type, hex_address, "
-                "attack, defense, speed, morale, supply, recon, hp "
-                "FROM enemy_units WHERE guild_id=$1 AND planet_id=$2 AND is_active=TRUE "
-                "ORDER BY id",
-                i.guild_id, planet_id)
-            queued = await conn.fetch(
-                "SELECT enemy_unit_id, target_address FROM enemy_gm_moves "
-                "WHERE guild_id=$1 AND planet_id=$2",
-                i.guild_id, planet_id)
-            planet = await conn.fetchrow(
-                "SELECT name FROM planets WHERE guild_id=$1 AND id=$2",
-                i.guild_id, planet_id)
-        queued_map  = {r["enemy_unit_id"]: r["target_address"] for r in queued}
-        planet_name = planet["name"] if planet else f"#{planet_id}"
-
-        if not rows:
-            await i.response.send_message(
-                f"No active enemy units on **{planet_name}**.", ephemeral=True)
+            theme   = await get_theme(conn, i.guild_id)
+            planets = await conn.fetch(
+                "SELECT id, name FROM planets WHERE guild_id=$1 ORDER BY sort_order, id",
+                i.guild_id)
+        if not planets:
+            await i.response.send_message("No planets configured.", ephemeral=True)
             return
-
-        lines = []
-        for r in rows:
-            hexes    = max(1, (r["speed"] or 10) // 10)
-            move_tag = f" → `{queued_map[r['id']]}`" if r["id"] in queued_map else ""
-            lines.append(
-                f"**ID {r['id']}** `{r['hex_address']}`{move_tag}\n"
-                f"┣ **{r['unit_type']}** — HP **{r['hp'] or 100}**\n"
-                f"┗ ATK `{r['attack']}` DEF `{r['defense']}` "
-                f"SPD `{r['speed']}` ({hexes}hex/turn) "
-                f"MOR `{r['morale']}` SUP `{r['supply']}` REC `{r['recon']}`"
-            )
-
-        # Paginate into multiple embeds if needed (4096 char limit per embed)
-        embeds, current, char_count = [], [], 0
-        for line in lines:
-            if char_count + len(line) > 3800 and current:
-                embeds.append("\n\n".join(current))
-                current, char_count = [], 0
-            current.append(line)
-            char_count += len(line)
-        if current:
-            embeds.append("\n\n".join(current))
-
-        color       = theme.get("color", 0xAA2222)
-        first_embed = discord.Embed(
-            title=f"Enemy Units ({len(rows)}) on {planet_name}",
-            description=embeds[0],
-            color=color)
-        first_embed.set_footer(text="→ = queued GM move this turn")
-
-        await i.response.send_message(embed=first_embed, ephemeral=True)
-        for chunk in embeds[1:]:
-            await i.followup.send(
-                embed=discord.Embed(description=chunk, color=color), ephemeral=True)
+        color = theme.get("color", 0xAA2222)
+        view  = _EnemyListPlanetPickView(list(planets), i.guild_id, color)
+        await i.response.send_message(
+            "Select a planet to list its enemy units:", view=view, ephemeral=True)
 
     async def list_enemy_types(self, i: discord.Interaction, b: discord.ui.Button):
         """Show all known unit type presets so GMs know what names to spawn."""
@@ -2597,6 +2551,116 @@ class _BulkSpawnEnemyModal(discord.ui.Modal, title="Bulk Spawn Enemy Units"):
             parts_out.extend(errors[:10])
         await i.response.send_message("\n".join(parts_out)[:2000], ephemeral=True)
         await _refresh_public_surfaces(i.client, i.guild_id)
+
+
+# ── Enemy list: planet picker → paginated unit list ───────────────────────────
+
+PAGE_SIZE = 12  # units shown per page
+
+def _build_enemy_embed(rows, queued_map, planet_name, page, total_pages, color):
+    """Build one page embed for the enemy list."""
+    start = page * PAGE_SIZE
+    chunk = rows[start:start + PAGE_SIZE]
+    lines = []
+    for r in chunk:
+        hexes    = max(1, (r["speed"] or 10) // 10)
+        move_tag = f" → `{queued_map[r['id']]}`" if r["id"] in queued_map else ""
+        lines.append(
+            f"**ID {r['id']}** `{r['hex_address']}`{move_tag}\n"
+            f"┣ **{r['unit_type']}** — HP **{r['hp'] or 100}**\n"
+            f"┗ ATK `{r['attack']}` DEF `{r['defense']}` "
+            f"SPD `{r['speed']}` ({hexes}hex/turn) "
+            f"MOR `{r['morale']}` SUP `{r['supply']}` REC `{r['recon']}`"
+        )
+    embed = discord.Embed(
+        title=f"Enemy Units on {planet_name}  [{len(rows)} total]",
+        description="\n\n".join(lines),
+        color=color,
+    )
+    embed.set_footer(text=f"Page {page + 1} of {total_pages}  •  → = queued GM move")
+    return embed
+
+
+class _EnemyListPageView(discord.ui.View):
+    """Paginated enemy list with ◀ / ▶ buttons."""
+
+    def __init__(self, rows, queued_map, planet_name, color):
+        super().__init__(timeout=300)
+        self._rows        = rows
+        self._queued_map  = queued_map
+        self._planet_name = planet_name
+        self._color       = color
+        self._page        = 0
+        self._total       = max(1, -(-len(rows) // PAGE_SIZE))  # ceil div
+        self._sync_buttons()
+
+    def _sync_buttons(self):
+        self.prev_btn.disabled = self._page == 0
+        self.next_btn.disabled = self._page >= self._total - 1
+
+    def _current_embed(self):
+        return _build_enemy_embed(
+            self._rows, self._queued_map,
+            self._planet_name, self._page, self._total, self._color)
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, i: discord.Interaction, b: discord.ui.Button):
+        self._page -= 1
+        self._sync_buttons()
+        await i.response.edit_message(embed=self._current_embed(), view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    async def next_btn(self, i: discord.Interaction, b: discord.ui.Button):
+        self._page += 1
+        self._sync_buttons()
+        await i.response.edit_message(embed=self._current_embed(), view=self)
+
+
+class _EnemyListPlanetPickView(discord.ui.View):
+    """Planet dropdown; on select fetches enemies and shows paginated list."""
+
+    def __init__(self, planets: list, guild_id: int, color: int):
+        super().__init__(timeout=60)
+        self._guild_id = guild_id
+        self._color    = color
+        options = [
+            discord.SelectOption(label=p["name"], value=str(p["id"]))
+            for p in planets[:25]
+        ]
+        select = discord.ui.Select(placeholder="Select a planet to list enemies…", options=options)
+        select.callback = self._on_select
+        self.add_item(select)
+
+    async def _on_select(self, i: discord.Interaction):
+        planet_id   = int(i.data["values"][0])
+        planet_name = next(
+            (o.label for o in self.children[0].options if o.value == str(planet_id)),
+            f"#{planet_id}")
+
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, unit_type, hex_address, "
+                "attack, defense, speed, morale, supply, recon, hp "
+                "FROM enemy_units "
+                "WHERE guild_id=$1 AND planet_id=$2 AND is_active=TRUE "
+                "ORDER BY id",
+                self._guild_id, planet_id)
+            queued = await conn.fetch(
+                "SELECT enemy_unit_id, target_address FROM enemy_gm_moves "
+                "WHERE guild_id=$1 AND planet_id=$2",
+                self._guild_id, planet_id)
+
+        if not rows:
+            await i.response.edit_message(
+                content=f"No active enemy units on **{planet_name}**.",
+                embed=None, view=None)
+            return
+
+        queued_map = {r["enemy_unit_id"]: r["target_address"] for r in queued}
+        view       = _EnemyListPageView(list(rows), queued_map, planet_name, self._color)
+        await i.response.edit_message(
+            content=None, embed=view._current_embed(), view=view)
 
 
 # ── Per-planet automation: planet picker → modal ──────────────────────────────
