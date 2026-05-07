@@ -601,10 +601,6 @@ class ContractActionView(View):
             await i.response.send_message(
                 f"Contract is **{c['status']}** — deployment opens once the GM activates it.",
                 ephemeral=True); return
-        if c["status"] == "active":
-            await i.response.send_message(
-                "This contract already has an active tactical operation. Late deployments are closed.",
-                ephemeral=True); return
         from cogs.squadron_cog import open_returning_deploy
         await open_returning_deploy(i, self.contract_id)
 

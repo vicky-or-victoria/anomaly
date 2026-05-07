@@ -853,10 +853,6 @@ class DeployModal(discord.ui.Modal, title="Deploy Your Unit"):
             planet_id = active_contract["planet_id"] if active_contract["planet_id"] else await get_active_planet_id(conn, self.guild_id)
             if active_contract["status"] not in ("deployable", "active") or (active_contract["fleet_count"] or 0) < 1:
                 await interaction.followup.send("That contract is not deployable yet.", ephemeral=True); return
-            if active_contract["status"] == "active":
-                await interaction.followup.send(
-                    "This contract already has an active tactical operation. Late deployments are closed.",
-                    ephemeral=True); return
             if (active_contract['deployed_units'] or 0) >= (active_contract['deployment_capacity'] or 0):
                 await interaction.followup.send("All deployment slots are filled for this contract.", ephemeral=True); return
             existing  = await conn.fetchrow(
@@ -1035,11 +1031,6 @@ class ExistingDeployModal(discord.ui.Modal, title="Deploy Existing Unit"):
             planet_id = active_contract["planet_id"] if active_contract["planet_id"] else await get_active_planet_id(conn, self.guild_id)
             if active_contract["status"] not in ("deployable", "active") or (active_contract["fleet_count"] or 0) < 1:
                 await interaction.followup.send("That contract is not deployable yet.", ephemeral=True)
-                return
-            if active_contract["status"] == "active":
-                await interaction.followup.send(
-                    "This contract already has an active tactical operation. Late deployments are closed.",
-                    ephemeral=True)
                 return
             if (active_contract['deployed_units'] or 0) >= (active_contract['deployment_capacity'] or 0):
                 await interaction.followup.send("All deployment slots are filled for this contract.", ephemeral=True)
@@ -1252,11 +1243,6 @@ async def open_returning_deploy(interaction: discord.Interaction, contract_id: i
         planet_id = active_contract["planet_id"] if active_contract["planet_id"] else await get_active_planet_id(conn, interaction.guild_id)
         if active_contract["status"] not in ("deployable", "active") or (active_contract["fleet_count"] or 0) < 1:
             await interaction.response.send_message("That contract is not deployable yet.", ephemeral=True)
-            return
-        if active_contract["status"] == "active":
-            await interaction.response.send_message(
-                "This contract already has an active tactical operation. Late deployments are closed.",
-                ephemeral=True)
             return
         if (active_contract['deployed_units'] or 0) >= (active_contract['deployment_capacity'] or 0):
             await interaction.response.send_message("All deployment slots are filled for this contract.", ephemeral=True)
