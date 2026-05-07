@@ -18,7 +18,7 @@ from discord.ext import commands
 
 from utils.db import get_pool, init_schema
 from utils.turn_engine import TurnEngine, TurnReportView
-from views.menu import MainMenuView, EnlistView
+from views.menu import MainMenuView, EnlistView, ContractBoardView
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,6 +70,10 @@ class Warbot(commands.Bot):
         self.add_view(MainMenuView(guild_id=0))
         self.add_view(EnlistView(guild_id=0))
         self.add_view(TurnReportView())
+        # ContractBoardView needs a placeholder row to register its select's custom_id
+        _placeholder_option = type("R", (), {"id": 0, "title": "—", "status": "deployable",
+            "difficulty": "standard", "enemy": "—", "deployment_capacity": 0, "deployed_units": 0})()
+        self.add_view(ContractBoardView(guild_id=0, rows=[_placeholder_option]))
 
         # Start the turn engine background loop
         self.turn_engine.start()

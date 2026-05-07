@@ -476,7 +476,11 @@ class ContractSelect(discord.ui.Select):
                 value=str(c["id"]),
                 description=f"{diff} {c['status'].title()} · vs {c['enemy']} · {dep}/{cap} deployed"[:100],
             ))
-        super().__init__(placeholder="Select a contract to view details...", options=options)
+        super().__init__(
+            placeholder="Select a contract to view details...",
+            options=options,
+            custom_id="contract_board_select",
+        )
 
     async def callback(self, interaction: discord.Interaction):
         selected_id = int(self.values[0])
@@ -501,7 +505,7 @@ class ContractSelect(discord.ui.Select):
 class ContractBoardView(View):
     """Ephemeral board shown to a player — dropdown listing all contracts."""
     def __init__(self, guild_id: int, rows=None):
-        super().__init__(timeout=300)
+        super().__init__(timeout=None)
         self.guild_id = guild_id
         if rows:
             self.add_item(ContractSelect(rows))
@@ -555,9 +559,13 @@ async def _send_contract_board(i: discord.Interaction):
 class ContractActionView(View):
     """Sent ephemerally after the player picks a contract from the dropdown."""
     def __init__(self, guild_id: int, contract_id: int):
-        super().__init__(timeout=300)
+        super().__init__(timeout=None)
         self.guild_id    = guild_id
         self.contract_id = contract_id
+        # Set dynamic custom_ids encoding contract_id so the view survives in memory
+        for child in self.children:
+            if hasattr(child, "custom_id") and child.custom_id.startswith("contract_action_"):
+                child.custom_id = f"{child.custom_id}_{contract_id}"
 
     async def _get_contract(self, i: discord.Interaction):
         pool = await get_pool()
@@ -580,7 +588,8 @@ class ContractActionView(View):
         embed = build_contract_detail_embed(theme, c)
         await i.response.edit_message(embed=embed, view=ContractActionView(i.guild_id, self.contract_id))
 
-    @discord.ui.button(label="🚀 Deploy Roster", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="🚀 Deploy Roster", style=discord.ButtonStyle.primary, row=0,
+                       custom_id="contract_action_deploy")
     async def deploy_contract(self, i: discord.Interaction, b: Button):
         c = await self._get_contract(i)
         if c is None: return
@@ -595,7 +604,8 @@ class ContractActionView(View):
         from cogs.squadron_cog import open_returning_deploy
         await open_returning_deploy(i, self.contract_id)
 
-    @discord.ui.button(label="⚔️ Enlist New Unit", style=discord.ButtonStyle.success, row=1)
+    @discord.ui.button(label="⚔️ Enlist New Unit", style=discord.ButtonStyle.success, row=1,
+                       custom_id="contract_action_enlist")
     async def new_unit_contract(self, i: discord.Interaction, b: Button):
         await i.response.send_message(
             "Create roster units from the **Enlist** button. Contract deployment happens through **Deploy Roster**.",
