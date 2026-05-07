@@ -476,6 +476,8 @@ class ContractSelect(discord.ui.Select):
                 value=str(c["id"]),
                 description=f"{diff} {c['status'].title()} · vs {c['enemy']} · {dep}/{cap} deployed"[:100],
             ))
+        if not options:
+            options = [discord.SelectOption(label="No contracts available", value="none")]
         super().__init__(
             placeholder="Select a contract to view details...",
             options=options,
@@ -483,6 +485,9 @@ class ContractSelect(discord.ui.Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "none":
+            await interaction.response.send_message("No contracts are currently available.", ephemeral=True)
+            return
         selected_id = int(self.values[0])
         pool = await get_pool()
         async with pool.acquire() as conn:
@@ -507,8 +512,7 @@ class ContractBoardView(View):
     def __init__(self, guild_id: int, rows=None):
         super().__init__(timeout=None)
         self.guild_id = guild_id
-        if rows:
-            self.add_item(ContractSelect(rows))
+        self.add_item(ContractSelect(rows or []))
 
 
 async def _send_contract_board(i: discord.Interaction):

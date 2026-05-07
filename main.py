@@ -70,10 +70,7 @@ class Warbot(commands.Bot):
         self.add_view(MainMenuView(guild_id=0))
         self.add_view(EnlistView(guild_id=0))
         self.add_view(TurnReportView())
-        # ContractBoardView needs a placeholder row to register its select's custom_id
-        _placeholder_option = type("R", (), {"id": 0, "title": "—", "status": "deployable",
-            "difficulty": "standard", "enemy": "—", "deployment_capacity": 0, "deployed_units": 0})()
-        self.add_view(ContractBoardView(guild_id=0, rows=[_placeholder_option]))
+        self.add_view(ContractBoardView(guild_id=0))
 
         # Start the turn engine background loop
         self.turn_engine.start()
