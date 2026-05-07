@@ -645,10 +645,12 @@ async def _send_leaderboard(i: discord.Interaction):
         theme     = await get_theme(conn, i.guild_id)
         planet_id = await get_active_planet_id(conn, i.guild_id)
         rows      = await conn.fetch(
-            "SELECT * "
-            "FROM squadrons WHERE guild_id=$1 AND planet_id=$2 AND is_active=TRUE "
-            "ORDER BY xp DESC, id DESC LIMIT 10",
+            "SELECT DISTINCT ON (owner_id) * "
+            "FROM squadrons WHERE guild_id=$1 AND planet_id=$2 "
+            "ORDER BY owner_id, xp DESC, id DESC",
             i.guild_id, planet_id)
+        # Sort by XP descending after dedup
+        rows = sorted(rows, key=lambda r: r["xp"] if "xp" in r.keys() else 0, reverse=True)[:10]
     if not rows:
         await i.response.send_message("No units enlisted yet.", ephemeral=True); return
 
@@ -661,8 +663,9 @@ async def _send_leaderboard(i: discord.Interaction):
         power_bar = _mini_bar(power, max_val=160, length=8)
         unit_name = r["unit_name"] if "unit_name" in r.keys() else default_unit_name(r["brigade"])
         tier = resolve_veterancy_tier(r["xp"] if "xp" in r.keys() else 0)
+        deployed_icon = "⚔️" if r["is_active"] else "🏠"
         lines.append(
-            f"{prefix} **{r['owner_name']}** — {unit_name}\n"
+            f"{prefix} **{r['owner_name']}** — {unit_name}  {deployed_icon}\n"
             f"  `{power_bar}` **{power}** pts | {tier} | XP {r['xp'] if 'xp' in r.keys() else 0}"
         )
 
@@ -671,7 +674,7 @@ async def _send_leaderboard(i: discord.Interaction):
         description="\n".join(lines),
         color=theme.get("color", 0xAA2222),
     )
-    embed.set_footer(text=f"Power uses effective stats after veterancy and evolution | {theme.get('bot_name','WARBOT')}")
+    embed.set_footer(text=f"⚔️ = deployed  🏠 = not yet deployed  ·  {theme.get('bot_name','WARBOT')}")
     await i.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -1141,4 +1144,3 @@ async def refresh_public_panels(bot, guild_id: int, conn):
     await update_menu_embed(bot, guild_id, conn)
     await refresh_enlist_counter(bot, guild_id, conn)
     await refresh_contract_board(bot, guild_id, conn)
-

@@ -431,7 +431,7 @@ class AdminPanelView(discord.ui.View):
             async with pool.acquire() as conn:
                 if not await has_active_contracts(conn, i.guild_id):
                     await i.followup.send(
-                        "❌ No active contracts — assign fleets to a contract first.", ephemeral=True)
+                        "❌ No active contracts — create and post a contract first.", ephemeral=True)
                     return
                 await self.bot.turn_engine._resolve(conn, i.guild_id)
             await i.followup.send("OK Turn forced successfully.", ephemeral=True)
@@ -452,8 +452,8 @@ def _gm_panel_embed(theme: dict) -> discord.Embed:
         color=theme.get("color", 0xAA2222),
         description=(
             "**Contract Lifecycle**\n"
-            "📋 Create → 🔒 Lock Acceptance → 🚀 Assign Fleets → 🏁 Conclude\n"
-            "📄 List Contracts — see all live contract IDs and statuses at a glance.\n\n"
+            "📋 Create → ⏸️ Halt New Deploys (optional) → 🏁 Conclude\n"
+            "Contracts post immediately as active and deployable.\n\n"
             "**Enemy Management**\n"
             "Spawn, bulk-spawn, move, bulk-move, list, or remove enemy units.\n\n"
             "**GM Map** — all player + enemy positions with labels.\n\n"
@@ -467,8 +467,7 @@ class GmPanelView(discord.ui.View):
     GM panel — contract control + enemy unit management.
 
     Contract lifecycle (Row 0):
-      Create → Lock Acceptance → Assign Fleets → Conclude
-      At any point: List Contracts (see IDs) · Cancel Contract (remove from board)
+      Create → (optional) Halt New Deploys → Conclude
 
     Row 1: Spawn Enemy | Bulk Spawn
     Row 2: Move Enemy  | Bulk Move  | List Enemies
@@ -492,8 +491,7 @@ class GmPanelView(discord.ui.View):
 
     @discord.ui.button(label="📋 Create Contract", style=discord.ButtonStyle.success, row=0)
     async def start_contract(self, i: discord.Interaction, b: discord.ui.Button):
-        """Post a new contract to the board — opens a planet selector first, then the details modal.
-        Does NOT wipe war data — use Assign Fleets to open deployment."""
+        """Post a new contract — auto-sets to deployable. Opens planet selector then modal."""
         if not await self._check(i): return
         pool = await get_pool()
         async with pool.acquire() as conn:
@@ -502,7 +500,6 @@ class GmPanelView(discord.ui.View):
                 "SELECT id, name, contractor, enemy_type FROM planets WHERE guild_id=$1 ORDER BY sort_order, id",
                 i.guild_id)
         if not planets:
-            # No planets configured — fall back to modal with active planet
             await i.response.send_modal(_CreateContractModal(self.bot))
             return
         planet_dicts = [
@@ -524,50 +521,52 @@ class GmPanelView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="🔒 Lock Acceptance", style=discord.ButtonStyle.secondary, row=0)
-    async def lock_contract_acceptance(self, i: discord.Interaction, b: discord.ui.Button):
-        """Close sign-ups on the most recent accepting contract.
-        Auto-selects the newest 'accepting' contract — no ID needed."""
+    @discord.ui.button(label="⏸️ Halt New Deploys", style=discord.ButtonStyle.secondary, row=0)
+    async def halt_deploys(self, i: discord.Interaction, b: discord.ui.Button):
+        """Lock the deployable contract — keeps it running but stops new unit deployments."""
         if not await self._check(i): return
-        await i.response.send_modal(_LockContractModal(self.bot))
-
-    @discord.ui.button(label="🚀 Assign Fleets", style=discord.ButtonStyle.primary, row=0)
-    async def assign_contract_fleets(self, i: discord.Interaction, b: discord.ui.Button):
-        """Assign fleets to a locked contract, setting deployment capacity and opening deployment.
-        Auto-selects the newest locked contract — just enter fleet count."""
-        if not await self._check(i): return
-        await i.response.send_modal(_AssignFleetModal(self.bot))
+        await i.response.send_modal(_HaltDeploysModal(self.bot))
 
     @discord.ui.button(label="🏁 Conclude Contract", style=discord.ButtonStyle.danger, row=0)
     async def conclude_contract(self, i: discord.Interaction, b: discord.ui.Button):
-        """End an active contract with success or failure, return fleets, retire deployed units."""
+        """End an active contract with success or failure and retire deployed units."""
         if not await self._check(i): return
         await i.response.send_modal(_ContractOutcomeModal(self.bot))
 
-    @discord.ui.button(label="🚫 Cancel Contract", style=discord.ButtonStyle.secondary, row=0)
-    async def cancel_contract(self, i: discord.Interaction, b: discord.ui.Button):
-        """Remove a non-active contract from the board and return any pre-assigned fleets."""
+    @discord.ui.button(label="🗺️ GM Map", style=discord.ButtonStyle.primary, row=0)
+    async def gm_map(self, i: discord.Interaction, b: discord.ui.Button):
+        """Render the full map with all player and enemy positions labelled."""
         if not await self._check(i): return
-        await i.response.send_modal(_CancelContractModal(self.bot))
+        await i.response.defer(ephemeral=True, thinking=True)
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            planet_id = await get_active_planet_id(conn, i.guild_id)
+        try:
+            from utils.map_render import render_map_for_guild
+            buf = await render_map_for_guild(i.guild_id, None, planet_id=planet_id, gm_mode=True)
+            if buf:
+                await i.followup.send(file=discord.File(buf, "gm_map.png"), ephemeral=True)
+            else:
+                await i.followup.send("Map render returned no data.", ephemeral=True)
+        except Exception as e:
+            await i.followup.send(f"Map render failed: {e}", ephemeral=True)
 
     @discord.ui.button(label="📄 List Contracts", style=discord.ButtonStyle.secondary, row=1)
     async def list_contracts(self, i: discord.Interaction, b: discord.ui.Button):
-        """Show all live contracts with their IDs, statuses, and fleet counts."""
+        """Show all live contracts with their IDs, statuses, and deployment counts."""
         if not await self._check(i): return
         pool = await get_pool()
         async with pool.acquire() as conn:
             theme = await get_theme(conn, i.guild_id)
             rows  = await conn.fetch(
-                "SELECT id, title, status, fleet_count, deployment_capacity, deployed_units "
+                "SELECT id, title, status, deployment_capacity, deployed_units "
                 "FROM contracts c "
                 "WHERE guild_id=$1 AND status NOT IN ('concluded_success','concluded_failure','cancelled') "
                 "ORDER BY id DESC LIMIT 15",
                 i.guild_id)
         if not rows:
             await i.response.send_message("No active contracts.", ephemeral=True); return
-        status_icon = {
-            "open":"🔓","accepting":"✅","locked":"🔒","deployable":"🚀","active":"⚔️","suspended":"⏸️"
-        }
+        status_icon = {"deployable":"🚀","active":"⚔️","suspended":"⏸️","halted":"⏸️"}
         lines = []
         for r in rows:
             icon = status_icon.get(r["status"], "•")
@@ -575,14 +574,14 @@ class GmPanelView(discord.ui.View):
             dep  = r["deployed_units"] or 0
             lines.append(
                 f"{icon} **#{r['id']:03d}** — {r['title']}\n"
-                f"  Status: **{r['status']}**  ·  Fleets: **{r['fleet_count'] or 0}**  ·  Deployed: **{dep}/{cap}**"
+                f"  Status: **{r['status']}**  ·  Deployed: **{dep}/{cap}**"
             )
         embed = discord.Embed(
             title=f"Live Contracts ({len(rows)})",
             description="\n".join(lines),
             color=theme.get("color", 0xAA2222),
         )
-        embed.set_footer(text="Use the contract ID in Lock / Assign / Conclude if needed.")
+        embed.set_footer(text="Use the contract ID in Halt / Conclude if needed.")
         await i.response.send_message(embed=embed, ephemeral=True)
 
     # ──── Row 1: Enemy Management ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -665,29 +664,6 @@ class GmPanelView(discord.ui.View):
     async def remove_enemy(self, i: discord.Interaction, b: discord.ui.Button):
         if not await self._check(i): return
         await i.response.send_modal(_RemoveEnemyModal())
-
-    @discord.ui.button(label="GM Map", style=discord.ButtonStyle.success, row=1)
-    async def gm_map(self, i: discord.Interaction, b: discord.ui.Button):
-        if not await self._check(i): return
-        await i.response.defer(ephemeral=True, thinking=True)
-        try:
-            pool = await get_pool()
-            async with pool.acquire() as conn:
-                from utils.map_render import render_gm_map_for_guild
-                buf = await render_gm_map_for_guild(i.guild_id, conn)
-            file = discord.File(buf, filename="gm_map.png")
-            embed = discord.Embed(
-                title="GM Map - All Unit Positions",
-                description=(
-                    "🔵 **Blue labels** = player unit names (→dest if in transit)\n"
-                    "🔴 **Red labels** = enemy units (#ID + type)"
-                ),
-                color=0x226622,
-            )
-            embed.set_image(url="attachment://gm_map.png")
-            await i.followup.send(embed=embed, file=file, ephemeral=True)
-        except Exception as e:
-            await i.followup.send(f"Error rendering GM map: {e}", ephemeral=True)
 
     @discord.ui.button(label="Grant Banner", style=discord.ButtonStyle.primary, row=4)
     async def grant_banner(self, i: discord.Interaction, b: discord.ui.Button):
@@ -902,14 +878,13 @@ class GmPanelPagerView(_PagedPanelView):
         pages = [
             {
                 "title": "GM Panel / Contract",
-                "description": "Full contract lifecycle: Create → Lock → Assign Fleets → Conclude. List Contracts shows all live IDs. Cancel removes a pre-deployment contract cleanly.",
+                "description": "Contract lifecycle: Create → (optional) Halt New Deploys → Conclude. Contracts post immediately as deployable.",
                 "items": [
-                    {"label": "📋 Create Contract", "method": "start_contract", "style": discord.ButtonStyle.success},
-                    
-                    {"label": "🔒 Lock Acceptance", "method": "lock_contract_acceptance"},
-                    {"label": "🚀 Assign Fleets", "method": "assign_contract_fleets", "style": discord.ButtonStyle.primary},
-                    {"label": "🏁 Conclude Contract", "method": "conclude_contract", "style": discord.ButtonStyle.danger},
-                    {"label": "GM Map", "method": "gm_map", "style": discord.ButtonStyle.success},
+                    {"label": "📋 Create Contract",    "method": "start_contract",   "style": discord.ButtonStyle.success},
+                    {"label": "⏸️ Halt New Deploys",   "method": "halt_deploys"},
+                    {"label": "🏁 Conclude Contract",  "method": "conclude_contract","style": discord.ButtonStyle.danger},
+                    {"label": "📄 List Contracts",     "method": "list_contracts"},
+                    {"label": "🗺️ GM Map",             "method": "gm_map",           "style": discord.ButtonStyle.primary},
                 ],
             },
             {
@@ -1779,7 +1754,7 @@ class _PlanetPickerView(discord.ui.View):
 
 class _CreateContractModal(discord.ui.Modal, title="Create Contract"):
     """Creates a contract entry on the board. Players can then accept it.
-    The GM assigns fleets separately, which opens deployment."""
+    The GM assigns a deployment capacity; contract goes live immediately as deployable."""
 
     contract_name = discord.ui.TextInput(
         label="Contract Name",
@@ -1818,27 +1793,28 @@ class _CreateContractModal(discord.ui.Modal, title="Create Contract"):
                 planet    = await conn.fetchrow(
                     "SELECT name, contractor, enemy_type FROM planets WHERE guild_id=$1 AND id=$2",
                     i.guild_id, planet_id)
-            # Insert the contract in 'accepting' state — no data wipe, no game reset.
-            # Players sign up via the contract board; the GM then assigns fleets to deploy.
+            # Insert the contract as 'deployable' immediately — players can deploy right away.
+            default_cap = 20  # reasonable default; GM can conclude to end early
             await conn.execute(
                 "INSERT INTO contracts "
                 "(guild_id, planet_id, title, planet_system, enemy, difficulty, description, "
                 " status, fleet_count, deployment_capacity, created_by_gm) "
-                "VALUES ($1,$2,$3,$4,$5,'standard',$6,'accepting',0,0,$7)",
+                "VALUES ($1,$2,$3,$4,$5,'standard',$6,'deployable',1,$7,$8)",
                 i.guild_id,
                 planet_id,
                 name,
                 planet["name"]       if planet else "Unknown",
                 planet["enemy_type"] if planet else "Unknown",
                 desc,
+                default_cap,
                 i.user.id,
             )
             theme = await get_theme(conn, i.guild_id)
             cfg   = await conn.fetchrow(
                 "SELECT announcement_channel_id FROM guild_config WHERE guild_id=$1", i.guild_id)
         await i.response.send_message(
-            f"✅ **Contract '{name}'** posted to the board on **{planet['name'] if planet else '?'}**.\n"
-            f"Use **Assign Fleets** when ready to open deployment.",
+            f"✅ **Contract '{name}'** posted and open for deployment on **{planet['name'] if planet else '?'}**.\n"
+            f"Players can deploy immediately from the Contract Board.",
             ephemeral=True)
         await _refresh_public_surfaces(self.bot, i.guild_id)
         if cfg and cfg["announcement_channel_id"]:
@@ -1852,8 +1828,7 @@ class _CreateContractModal(discord.ui.Modal, title="Create Contract"):
                         f"**Planet:** {planet['name'] if planet else '—'}\n"
                         f"**Contractor:** {planet['contractor'] if planet else '—'}\n"
                         f"**Enemy:** {planet['enemy_type'] if planet else '—'}\n\n"
-                        f"*Commandants may now accept this contract via the contract board.*\n"
-                        f"*Deployment opens once the GM assigns fleets.*"
+                        f"*Deployment is now open — commandants can deploy via the contract board.*"
                     ),
                 )
                 embed.set_footer(text=theme.get("flavor_text", "The contract must be fulfilled."))
@@ -1863,13 +1838,12 @@ class _CreateContractModal(discord.ui.Modal, title="Create Contract"):
 _StartContractModal = _CreateContractModal
 
 
-class _LockContractModal(discord.ui.Modal, title="Lock Contract Acceptance"):
-    """Close sign-ups on a contract. Auto-selects newest 'accepting' contract;
-    optionally enter a specific ID to target a different one."""
+class _HaltDeploysModal(discord.ui.Modal, title="Halt New Deployments"):
+    """Stop new deployments on a deployable contract — existing deployed units keep playing."""
 
     contract_id = discord.ui.TextInput(
         label="Contract ID  (leave blank for auto)",
-        placeholder="Leave blank to lock the newest accepting contract",
+        placeholder="Leave blank to halt the newest deployable contract",
         max_length=10,
         required=False,
     )
@@ -1894,284 +1868,26 @@ class _LockContractModal(discord.ui.Modal, title="Lock Contract Acceptance"):
             else:
                 contract = await conn.fetchrow(
                     "SELECT id, title, status FROM contracts "
-                    "WHERE guild_id=$1 AND status='accepting' "
+                    "WHERE guild_id=$1 AND status='deployable' "
                     "ORDER BY id DESC LIMIT 1",
                     i.guild_id)
             if not contract:
                 await i.response.send_message(
-                    "No accepting contract found. Create one first.", ephemeral=True); return
-            if contract["status"] not in ("accepting", "open"):
+                    "No deployable contract found.", ephemeral=True); return
+            if contract["status"] not in ("deployable", "active"):
                 await i.response.send_message(
-                    f"Contract **#{contract['id']:03d} — {contract['title']}** "
-                    f"is already **{contract['status']}** — cannot lock acceptance.",
+                    f"Contract **#{contract['id']:03d}** is **{contract['status']}** — cannot halt.",
                     ephemeral=True); return
             await conn.execute(
-                "UPDATE contracts SET status='locked' WHERE guild_id=$1 AND id=$2",
+                "UPDATE contracts SET status='active' WHERE guild_id=$1 AND id=$2",
                 i.guild_id, contract["id"])
         await i.response.send_message(
-            f"🔒 Sign-ups locked for **#{contract['id']:03d} — {contract['title']}**.\n"
-            f"Use **Assign Fleets** to set fleet count and open deployment.",
+            f"⏸️ New deployments halted for **#{contract['id']:03d} — {contract['title']}**.\n"
+            f"Existing deployed units continue. Use **Conclude Contract** to end.",
             ephemeral=True)
         await _refresh_public_surfaces(self.bot, i.guild_id)
 
 
-class _AssignFleetModal(discord.ui.Modal, title="Assign Fleets"):
-    """Assign fleets to a locked contract, which opens deployment for accepted players.
-    Auto-selects the newest locked contract; optionally specify a contract ID."""
-
-    contract_id = discord.ui.TextInput(
-        label="Contract ID  (leave blank for auto)",
-        placeholder="Leave blank to assign to the newest locked contract",
-        max_length=10,
-        required=False,
-    )
-    fleet_count = discord.ui.TextInput(
-        label="Fleet Count",
-        placeholder="e.g. 2  —  sets deployment capacity automatically",
-        max_length=4,
-        required=True,
-    )
-
-    def __init__(self, bot):
-        super().__init__()
-        self.bot = bot
-
-    async def on_submit(self, i: discord.Interaction):
-        raw_id = str(self.contract_id).strip()
-        try:
-            fleets = max(1, int(str(self.fleet_count).strip()))
-        except ValueError:
-            await i.response.send_message("Fleet count must be a number.", ephemeral=True); return
-
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            # Resolve contract
-            if raw_id:
-                try:
-                    cid = int(raw_id)
-                except ValueError:
-                    await i.response.send_message("Invalid contract ID.", ephemeral=True); return
-                contract = await conn.fetchrow(
-                    "SELECT id, title, status, fleet_count FROM contracts "
-                    "WHERE guild_id=$1 AND id=$2",
-                    i.guild_id, cid)
-            else:
-                contract = await conn.fetchrow(
-                    "SELECT id, title, status, fleet_count FROM contracts "
-                    "WHERE guild_id=$1 AND status IN ('locked','deployable','active') "
-                    "ORDER BY id DESC LIMIT 1",
-                    i.guild_id)
-            if not contract:
-                await i.response.send_message(
-                    "No locked contract found. Lock acceptance first.", ephemeral=True); return
-            if contract["status"] not in ("locked", "deployable", "active"):
-                await i.response.send_message(
-                    f"Contract **#{contract['id']:03d}** is **{contract['status']}** — "
-                    f"lock acceptance before assigning fleets.",
-                    ephemeral=True); return
-
-            cap = capacity_for_fleets(fleets)
-            await conn.execute(
-                "UPDATE contracts SET fleet_count=$1, deployment_capacity=$2, status='deployable' "
-                "WHERE guild_id=$3 AND id=$4",
-                fleets, cap, i.guild_id, contract["id"])
-
-        await i.response.send_message(
-            f"🚀 **{fleets}** fleet(s) assigned to **#{contract['id']:03d} — {contract['title']}**.\n"
-            f"Deployment capacity: **{cap}** unit(s).  Players can now deploy.",
-            ephemeral=True)
-        await _refresh_public_surfaces(self.bot, i.guild_id)
-
-
-class _ContractOutcomeModal(discord.ui.Modal, title="Conclude Contract"):
-    """End an active or deployable contract with a success or failure outcome.
-    Returns fleets to the pool, retires deployed units, and posts an announcement."""
-
-    contract_id = discord.ui.TextInput(
-        label="Contract ID  (leave blank for auto)",
-        placeholder="Leave blank to conclude the newest active contract",
-        max_length=10,
-        required=False,
-    )
-    outcome = discord.ui.TextInput(
-        label="Outcome  (SUCCESS or FAILURE)",
-        placeholder="SUCCESS / FAILURE",
-        max_length=10,
-        required=True,
-    )
-    rp_description = discord.ui.TextInput(
-        label="After-action report",
-        placeholder="What happened? Did the operatives fulfil the contract?",
-        style=discord.TextStyle.paragraph,
-        max_length=1200,
-        required=True,
-    )
-
-    def __init__(self, bot):
-        super().__init__()
-        self.bot = bot
-
-    async def on_submit(self, i: discord.Interaction):
-        raw_id      = str(self.contract_id).strip()
-        outcome_raw = str(self.outcome).strip().upper()
-        desc        = str(self.rp_description).strip()
-
-        if "SUCCESS" not in outcome_raw and "FAILURE" not in outcome_raw:
-            await i.response.send_message(
-                "Outcome must contain SUCCESS or FAILURE.", ephemeral=True); return
-
-        success = "SUCCESS" in outcome_raw
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            # Resolve contract
-            if raw_id:
-                try:
-                    cid = int(raw_id)
-                except ValueError:
-                    await i.response.send_message("Invalid contract ID.", ephemeral=True); return
-                contract = await conn.fetchrow(
-                    "SELECT id, title, fleet_count, status FROM contracts "
-                    "WHERE guild_id=$1 AND id=$2",
-                    i.guild_id, cid)
-            else:
-                contract = await conn.fetchrow(
-                    "SELECT id, title, fleet_count, status FROM contracts "
-                    "WHERE guild_id=$1 AND status IN ('active','deployable','locked') "
-                    "ORDER BY id DESC LIMIT 1",
-                    i.guild_id)
-            if not contract:
-                await i.response.send_message(
-                    "No active contract found to conclude.", ephemeral=True); return
-
-            theme     = await get_theme(conn, i.guild_id)
-            planet_id = await get_active_planet_id(conn, i.guild_id)
-            cfg       = await conn.fetchrow(
-                "SELECT announcement_channel_id FROM guild_config WHERE guild_id=$1",
-                i.guild_id)
-
-            # Operational tempo reward
-            tempo_gain   = random.randint(100, 200) if success else random.randint(25, 50)
-            tempo_result = await add_operational_tempo(conn, i.guild_id, tempo_gain)
-
-            # Archive contract
-            final_status = "concluded_success" if success else "concluded_failure"
-            await conn.execute(
-                "UPDATE contracts SET status=$1, fleet_count=0, deployment_capacity=0 "
-                "WHERE guild_id=$2 AND id=$3",
-                final_status, i.guild_id, contract["id"])
-
-            # Retire deployed units to the roster (is_active=FALSE keeps them for future contracts)
-            await conn.execute("""
-                UPDATE squadrons
-                SET is_active=FALSE,
-                    in_transit=FALSE,
-                    transit_destination=NULL,
-                    transit_turns_left=0,
-                    is_dug_in=FALSE,
-                    artillery_armed=FALSE,
-                    hexes_moved_this_turn=0
-                WHERE guild_id=$1 AND planet_id=$2
-                  AND id IN (
-                    SELECT squadron_id FROM unit_contract_map
-                    WHERE guild_id=$1 AND contract_id=$3
-                  )
-            """, i.guild_id, planet_id, contract["id"])
-            await conn.execute(
-                "DELETE FROM unit_contract_map WHERE guild_id=$1 AND contract_id=$2",
-                i.guild_id, contract["id"])
-
-        icon  = "🏆" if success else "💀"
-        label = "CONTRACT FULFILLED" if success else "CONTRACT FAILED"
-
-        await i.response.send_message(
-            f"{icon} **{label}** — #{contract['id']:03d} {contract['title']}\n"
-            f"Fleets returned to pool. Deployed units retired to roster.",
-            ephemeral=True)
-        await _refresh_public_surfaces(self.bot, i.guild_id)
-
-        if cfg and cfg["announcement_channel_id"]:
-            channel = i.guild.get_channel(cfg["announcement_channel_id"])
-            if channel:
-                embed = discord.Embed(
-                    title=f"{icon}  {label} — {contract['title']}",
-                    color=0x22AA44 if success else 0xAA2222,
-                    description=(
-                        f"{desc}\n\n"
-                        f"Operational Tempo +{tempo_gain} "
-                        f"→ **{tempo_result['tempo']}/{tempo_result['threshold']}**"
-                    ),
-                )
-                embed.set_footer(text=theme.get("flavor_text", "The contract must be fulfilled."))
-                await channel.send(embed=embed)
-        else:
-            await i.followup.send(
-                "⚠️ No announcement channel set — configure one in the Admin Panel.",
-                ephemeral=True)
-
-
-class _CancelContractModal(discord.ui.Modal, title="Cancel Contract"):
-    """Remove a contract from the board entirely. Only works on contracts that
-    haven't started deployment (accepting / locked). Returns any pre-assigned fleets."""
-
-    contract_id = discord.ui.TextInput(
-        label="Contract ID",
-        placeholder="e.g. 42 — see List Contracts for IDs",
-        max_length=10,
-        required=True,
-    )
-    reason = discord.ui.TextInput(
-        label="Cancellation reason  (shown on board)",
-        placeholder="e.g. Operational theatre changed",
-        max_length=200,
-        required=False,
-    )
-
-    def __init__(self, bot):
-        super().__init__()
-        self.bot = bot
-
-    async def on_submit(self, i: discord.Interaction):
-        raw = str(self.contract_id).strip()
-        try:
-            cid = int(raw)
-        except ValueError:
-            await i.response.send_message("Invalid contract ID.", ephemeral=True); return
-
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            contract = await conn.fetchrow(
-                "SELECT id, title, status, fleet_count FROM contracts "
-                "WHERE guild_id=$1 AND id=$2",
-                i.guild_id, cid)
-            if not contract:
-                await i.response.send_message("Contract not found.", ephemeral=True); return
-            if contract["status"] in ("concluded_success", "concluded_failure", "cancelled"):
-                await i.response.send_message(
-                    f"Contract #{cid:03d} is already **{contract['status']}** — nothing to cancel.",
-                    ephemeral=True); return
-            if contract["status"] in ("active", "deployable"):
-                await i.response.send_message(
-                    f"Contract #{cid:03d} is **{contract['status']}** with deployed units — "
-                    f"use **Conclude Contract** instead of cancelling.",
-                    ephemeral=True); return
-            await conn.execute(
-                "UPDATE contracts SET status='cancelled', fleet_count=0, deployment_capacity=0 "
-                "WHERE guild_id=$1 AND id=$2",
-                i.guild_id, cid)
-            # Remove all sign-ups
-            await conn.execute(
-                "DELETE FROM contract_acceptances WHERE guild_id=$1 AND contract_id=$2",
-                i.guild_id, cid)
-
-        reason_str = f" — *{str(self.reason).strip()}*" if str(self.reason).strip() else ""
-        await i.response.send_message(
-            f"🚫 Contract **#{cid:03d} — {contract['title']}** cancelled{reason_str}.",
-            ephemeral=True)
-        await _refresh_public_surfaces(self.bot, i.guild_id)
-
-# _PauseContractModal removed — use Lock Acceptance to close sign-ups
-# or Conclude Contract to end an active one.
-# _StartContractModal aliased to _CreateContractModal for backwards compatibility.
 
 
 class _SpawnEnemyModal(discord.ui.Modal, title="Spawn Enemy Unit"):

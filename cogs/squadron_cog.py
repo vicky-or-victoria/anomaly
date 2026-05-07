@@ -281,27 +281,44 @@ def _make_callback(fn, guild_id: int):
 # ── Unit panel builder (called from views/menu.py) ────────────────────────────
 
 async def send_unit_panel(interaction: discord.Interaction, guild_id: int):
-    """Build and send the full unit panel as an ephemeral response."""
+    """Build and send the full unit panel as an ephemeral response.
+    Shows the unit whether or not it's currently deployed on the map."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         theme     = await get_theme(conn, guild_id)
         planet_id = await get_active_planet_id(conn, guild_id)
-        sq        = await conn.fetchrow(
+        # Try active (deployed) unit first
+        sq = await conn.fetchrow(
             "SELECT * FROM squadrons "
             "WHERE guild_id=$1 AND planet_id=$2 AND owner_id=$3 AND is_active=TRUE LIMIT 1",
             guild_id, planet_id, interaction.user.id)
+        # Fall back to most recent enlisted unit on this planet (not yet deployed)
+        if not sq:
+            sq = await conn.fetchrow(
+                "SELECT * FROM squadrons "
+                "WHERE guild_id=$1 AND planet_id=$2 AND owner_id=$3 "
+                "ORDER BY id DESC LIMIT 1",
+                guild_id, planet_id, interaction.user.id)
         if not sq:
             await interaction.response.send_message(
-                f"No active {theme.get('player_unit', 'unit')}. "
-                f"Head to the enlistment board to join.", ephemeral=True)
+                f"No {theme.get('player_unit', 'unit')} found. "
+                f"Head to the enlistment board to create one.", ephemeral=True)
             return
         turn_count = await conn.fetchval(
             "SELECT COUNT(*) FROM turn_history WHERE guild_id=$1 AND planet_id=$2",
             guild_id, planet_id) or 0
 
+    is_deployed = sq["is_active"]
     budget        = max(1, effective_stats(sq)["speed"] // 2) if "speed" in sq.keys() else 5
     move_exhausted = sq["hexes_moved_this_turn"] >= budget if "hexes_moved_this_turn" in sq.keys() else False
     embed = await build_unit_embed(sq, theme, turn_count)
+
+    if not is_deployed:
+        embed.set_footer(text=f"⚠️ Not deployed — deploy this unit from the Contract Board first.  ·  {theme.get('bot_name','WARBOT')}")
+        # Show a minimal view without action buttons
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
     view  = UnitPanelView(guild_id, sq["brigade"], sq["in_transit"], move_exhausted=move_exhausted)
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 

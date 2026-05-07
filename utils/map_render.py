@@ -955,7 +955,6 @@ def _draw_overview_active_panel(draw, box, active_planet, fonts):
         ("Control", _overview_value(active_planet, "contractor")),
         ("Enemy Presence", _overview_value(active_planet, "enemy_type")),
         ("Active Contracts", str(n_con) if n_con else "—"),
-        ("Fleets Assigned", str(_overview_value(active_planet, "fleet_count", 0))),
         ("Units Deployed", f"{_overview_value(active_planet, 'player_units', 0)} / {_overview_value(active_planet, 'deployment_capacity', 0)}"),
         ("Hostile Contacts", str(_overview_value(active_planet, "enemy_units", 0))),
     ]
@@ -1183,8 +1182,8 @@ def _draw_overview_bottom_cards(draw, planets, active_planet_id, box, fonts):
             _overview_text(draw, (cx + 12, top + text_offset + 32), dep_str, fonts["small"],
                 (120, 160, 120), max_width=card_w - 24)
         elif has_contract:
-            _overview_text(draw, (cx + 12, top + text_offset + 32), "Awaiting fleets", fonts["small"],
-                (140, 110, 40), max_width=card_w - 24)
+            _overview_text(draw, (cx + 12, top + text_offset + 32), "Contract open", fonts["small"],
+                (120, 160, 120), max_width=card_w - 24)
 
 
 def render_planetary_system_overview(
@@ -1851,14 +1850,13 @@ async def render_overview_for_guild(guild_id: int, conn) -> io.BytesIO:
         """
         SELECT planet_id,
                COUNT(*)::INT                    AS contract_count,
-               SUM(fleet_count)::INT            AS fleet_count,
                SUM(deployment_capacity)::INT    AS deployment_capacity,
                SUM(deployed_units)::INT         AS deployed_units,
                MAX(CASE WHEN status='active'     THEN 1 ELSE 0 END)::INT AS has_active,
                MAX(CASE WHEN status='deployable' THEN 1 ELSE 0 END)::INT AS has_deployable
         FROM contracts
         WHERE guild_id=$1
-          AND status IN ('accepting','locked','deployable','active')
+          AND status IN ('deployable','active')
           AND planet_id IS NOT NULL
         GROUP BY planet_id
         """,
@@ -1867,14 +1865,13 @@ async def render_overview_for_guild(guild_id: int, conn) -> io.BytesIO:
         """
         SELECT planet_system,
                COUNT(*)::INT                    AS contract_count,
-               SUM(fleet_count)::INT            AS fleet_count,
                SUM(deployment_capacity)::INT    AS deployment_capacity,
                SUM(deployed_units)::INT         AS deployed_units,
                MAX(CASE WHEN status='active'     THEN 1 ELSE 0 END)::INT AS has_active,
                MAX(CASE WHEN status='deployable' THEN 1 ELSE 0 END)::INT AS has_deployable
         FROM contracts
         WHERE guild_id=$1
-          AND status IN ('accepting','locked','deployable','active')
+          AND status IN ('deployable','active')
           AND planet_id IS NULL
         GROUP BY planet_system
         """,
@@ -1893,7 +1890,6 @@ async def render_overview_for_guild(guild_id: int, conn) -> io.BytesIO:
 
         # Prefer planet_id match; fall back to name match
         cstats = contracts_by_pid.get(item["id"]) or contracts_by_name.get(item["name"])
-        item["fleet_count"]          = int(cstats["fleet_count"]         if cstats else 0)
         item["deployment_capacity"]  = int(cstats["deployment_capacity"] if cstats else 0)
         item["deployed_units"]       = int(cstats["deployed_units"]      if cstats else 0)
         item["contract_count"]       = int(cstats["contract_count"]      if cstats else 0)
